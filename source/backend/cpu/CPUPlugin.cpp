@@ -31,7 +31,11 @@ public:
         kernel_ = getCPUComputeKernel(ctx_->op_type());
         MNN_CHECK(nullptr != kernel_.get(), // NOLINT
                   "CPU compute kernel has not been registered for plugin op.");
-        kernel_->init(ctx_.get());
+        if (nullptr == kernel_.get()) {
+            mValid = false;
+            return;
+        }
+        mValid = kernel_->init(ctx_.get());
         mNeedAllocIO = kernel_->needAllocIO();
     }
     virtual ~CPUPlugin() = default;
@@ -45,9 +49,14 @@ public:
 private:
     std::unique_ptr<plugin::CPUKernelContext> ctx_;
     std::shared_ptr<plugin::CPUComputeKernel> kernel_;
+    bool mValid = true;
 };
 ErrorCode CPUPlugin::onResize(const std::vector<Tensor*>& inputs,
                                const std::vector<Tensor*>& outputs) {
+    if (!mValid || nullptr == kernel_.get()) {
+        MNN_ERROR("Plugin kernel init failed for op type %s.\n", ctx_->op_type().c_str());
+        return NOT_SUPPORT;
+    }
     ctx_->reset(inputs, outputs);
     auto success = kernel_->resize(ctx_.get());
     if (!success) {
@@ -58,6 +67,10 @@ ErrorCode CPUPlugin::onResize(const std::vector<Tensor*>& inputs,
 
 ErrorCode CPUPlugin::onExecute(const std::vector<Tensor*>& inputs, // NOLINT
                                const std::vector<Tensor*>& outputs) {
+    if (!mValid || nullptr == kernel_.get()) {
+        MNN_ERROR("Plugin kernel init failed for op type %s.\n", ctx_->op_type().c_str());
+        return NOT_SUPPORT;
+    }
     if (kernel_->compute(ctx_.get())) {
         return NO_ERROR;
     } else {

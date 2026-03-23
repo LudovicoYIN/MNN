@@ -64,6 +64,7 @@ struct SubModuleIO {
     std::vector<MNN::Express::VARP> inputs;
     std::vector<MNN::Express::VARP> outputs;
     std::vector<std::vector<int>> kvcache;
+    std::vector<std::vector<int>> replaceStates;
     int seqLen = 0;
 };
 static void _computeTensorMask(SubModuleInfo& m, const Net* net) {
@@ -379,23 +380,51 @@ static std::vector<SubModuleInfo> _createSubModuleInfo(const Net* net, const std
     }
     return submodule;
 }
-static std::set<std::string> _getAttentionName(const void* buffer, size_t bufferSize) {
-    std::set<std::string> attentionNames;
+struct StatefulOpInfo {
+    std::string type;
+    int numKHeads = 0;
+    int numVHeads = 0;
+    int headKDim = 0;
+    int headVDim = 0;
+};
+static std::map<std::string, StatefulOpInfo> _getStatefulOpInfo(const void* buffer, size_t bufferSize) {
+    std::map<std::string, StatefulOpInfo> statefulOps;
     auto net = flatbuffers::GetRoot<Net>(buffer);
     if (nullptr == net->oplists()) {
-        return attentionNames;
+        return statefulOps;
     }
     for (int i=0; i<net->oplists()->size(); ++i) {
         auto op = net->oplists()->GetAs<Op>(i);
+        if (nullptr == op->name()) {
+            continue;
+        }
         if (op->type() == OpType_Attention) {
             if (nullptr != op->main_as_AttentionParam()) {
                 if (op->main_as_AttentionParam()->kv_cache()) {
-                    attentionNames.insert(op->name()->str());
+                    StatefulOpInfo info;
+                    info.type = "Attention";
+                    statefulOps.insert(std::make_pair(op->name()->str(), std::move(info)));
                 }
+            }
+        } else if (op->type() == OpType_LinearAttention) {
+            auto param = op->main_as_LinearAttentionParam();
+            if (nullptr != param && nullptr != param->attn_type() && param->attn_type()->str() == "gated_delta_rule") {
+                StatefulOpInfo info;
+                info.type = "LinearAttention";
+                info.numKHeads = param->num_k_heads();
+                info.numVHeads = param->num_v_heads();
+                info.headKDim = param->head_k_dim();
+                info.headVDim = param->head_v_dim();
+                statefulOps.insert(std::make_pair(op->name()->str(), std::move(info)));
             }
         }
     }
-    return attentionNames;
+    return statefulOps;
+}
+static void _appendState(std::vector<std::vector<int>>& states, const std::vector<int>& shape) {
+    // State IO order must match QNN extra input/output registration order exactly.
+    // Do not deduplicate identical shapes across multiple stateful ops in the same subgraph.
+    states.emplace_back(shape);
 }
 static SubModuleIO _getSubModuleIO(std::vector<MNN::Express::VARP> inputs, const SubModuleInfo& info, const void* buffer, size_t bufferSize, std::string srcpath) {
     // Deep clone output to let the module release
@@ -411,7 +440,7 @@ static SubModuleIO _getSubModuleIO(std::vector<MNN::Express::VARP> inputs, const
         auto index = info.outputs[i];
         outputNames[i] = net->tensorName()->GetAsString(index)->str();
     }
-    auto attentionNames = _getAttentionName(buffer, bufferSize);
+    auto statefulOps = _getStatefulOpInfo(buffer, bufferSize);
     MNN::ScheduleConfig config;
     config.numThread = 1;
     std::shared_ptr<MNN::Express::Executor::RuntimeManager> rtmgr(MNN::Express::Executor::RuntimeManager::createRuntimeManager(config));
@@ -420,19 +449,30 @@ static SubModuleIO _getSubModuleIO(std::vector<MNN::Express::VARP> inputs, const
     std::shared_ptr<MNN::Express::Module> m(MNN::Express::Module::load(inputNames, outputNames, (const uint8_t*)buffer, bufferSize, rtmgr), MNN::Express::Module::destroy);
     MNN::TensorCallBackWithInfo beforeCallBack = [&](const std::vector<MNN::Tensor*>& ntensors, const MNN::OperatorInfo* info) {
         auto opName = info->name();
-        if (info->type() != "Attention") {
+        auto iter = statefulOps.find(opName);
+        if (iter == statefulOps.end()) {
             return true;
         }
-        if (attentionNames.find(opName) != attentionNames.end()) {
+        if (iter->second.type == "Attention") {
             auto query = ntensors[0];
             auto key = ntensors[1];
-            auto value = ntensors[2];
             int seq_len = query->length(1);
-            auto numHead = query->length(2);
             auto headDim = query->length(3);
             auto kvNumHead = key->length(2);
             std::vector<int> kvDims = {kvNumHead, 1, 1, headDim};
-            io.kvcache.emplace_back(kvDims);
+            _appendState(io.kvcache, kvDims);
+            io.seqLen = seq_len;
+        } else if (iter->second.type == "LinearAttention") {
+            auto qkv = ntensors[0];
+            auto convWeight = ntensors[3];
+            int batch = qkv->length(0);
+            int convDim = qkv->length(1);
+            int seq_len = qkv->length(2);
+            int convStateSize = convWeight->length(2) - 1;
+            std::vector<int> convStateShape = {batch, convDim, convStateSize};
+            std::vector<int> recurrentShape = {batch, iter->second.numVHeads, iter->second.headKDim, iter->second.headVDim};
+            _appendState(io.replaceStates, convStateShape);
+            _appendState(io.replaceStates, recurrentShape);
             io.seqLen = seq_len;
         }
         return true;
@@ -560,7 +600,7 @@ static std::unique_ptr<MNN::OpT> _compileSubModule(const SubModuleIO& io, SubMod
     attr->list.reset(new ListValueT);
     attr->list->s = {graphicName};
     extra->attr.emplace_back(std::move(attr));
-    if (io.kvcache.size() > 0) {
+    if (io.kvcache.size() > 0 || io.replaceStates.size() > 0) {
         attr.reset(new MNN::AttributeT);
         attr->key = "seq_len";
         attr->list.reset(new ListValueT);
@@ -573,60 +613,37 @@ static std::unique_ptr<MNN::OpT> _compileSubModule(const SubModuleIO& io, SubMod
         attr->tensor->dataType = DataType_DT_UINT8;
         flexbuffers::Builder builder;
         auto start = builder.StartMap();
-        builder.Int("number", io.kvcache.size() * 2);
-        builder.Int("max_length", gMaxKVSize);
-        builder.Int("axis", 2);
-        auto shapeStart = builder.StartVector("shape");
-
-        // Add State
+        auto entries = builder.StartVector("entries");
         for (int i=0; i<io.kvcache.size(); ++i) {
-            // Each KV has two state
             for (int j=0; j<2; ++j) {
-                auto vecStart = builder.StartVector();
+                auto entry = builder.StartMap();
+                builder.String("mode", "append");
+                builder.Int("axis", 2);
+                builder.Int("max_length", gMaxKVSize);
+                auto shape = builder.StartVector("shape");
                 for (int v=0; v<io.kvcache[i].size(); ++v) {
                     builder.Add(io.kvcache[i][v]);
                 }
-                builder.EndVector(vecStart, false, false);
+                builder.EndVector(shape, false, false);
+                builder.EndMap(entry);
             }
         }
-        builder.EndVector(shapeStart, false, false);
-
+        for (int i=0; i<io.replaceStates.size(); ++i) {
+            auto entry = builder.StartMap();
+            builder.String("mode", "replace");
+            builder.Int("axis", -1);
+            builder.Int("max_length", 0);
+            auto shape = builder.StartVector("shape");
+            for (int v=0; v<io.replaceStates[i].size(); ++v) {
+                builder.Add(io.replaceStates[i][v]);
+            }
+            builder.EndVector(shape, false, false);
+            builder.EndMap(entry);
+        }
+        builder.EndVector(entries, false, false);
         builder.EndMap(start);
         builder.Finish();
         attr->tensor->uint8s = builder.GetBuffer();
-        if (false) {
-            // Try Read
-            auto ref = flexbuffers::GetRoot(attr->tensor->uint8s.data(), attr->tensor->uint8s.size());
-            auto refMap = ref.AsMap();
-            auto keys = refMap.Keys();
-            int readNumber = 0;
-            int maxLength = 0;
-            std::vector<std::vector<int>> stateShape;
-            for (int i=0; i<keys.size(); ++i) {
-                auto key = keys[i].AsKey();
-                if (std::string(key) == "number") {
-                    readNumber = refMap.Values()[i].AsInt32();
-                    continue;
-                }
-                if (std::string(key) == "max_length") {
-                    maxLength = refMap.Values()[i].AsInt32();
-                    continue;
-                }
-                if (std::string(key) == "shape") {
-                    auto shapeVectors = refMap.Values()[i].AsVector();
-                    for (int u=0; u<shapeVectors.size(); ++u) {
-                        auto shapeV = shapeVectors[u].AsVector();
-                        std::vector<int> shapes;
-                        for (int v=0; v<shapeV.size(); ++v) {
-                            shapes.emplace_back(shapeV[v].AsInt32());
-                        }
-                        stateShape.emplace_back(shapes);
-                    }
-                    continue;
-                }
-            }
-            FUNC_PRINT(1);
-        }
         extra->attr.emplace_back(std::move(attr));
     }
 
@@ -638,6 +655,11 @@ static std::unique_ptr<MNN::OpT> _compileSubModule(const SubModuleIO& io, SubMod
         // CoreML Backend will name tensor as t + index
         attr->list->s[i] = std::string("t") + std::to_string(info.outputs[i]);
     }
+    extra->attr.emplace_back(std::move(attr));
+    attr.reset(new MNN::AttributeT);
+    attr->key = "output_aliases";
+    attr->list.reset(new ListValueT);
+    attr->list->s = outputNames;
     extra->attr.emplace_back(std::move(attr));
     attr.reset(new MNN::AttributeT);
     attr->key = "allInputShape";
@@ -1106,6 +1128,9 @@ int main(int argc, const char* argv[]) {
 
         for (int i=0; i<subModulesInfo.size(); ++i) {
             if (!subModulesInfo[i].isBreak) {
+                MNN_PRINT("Compile submodule inputIndex=%d moduleIndex=%d npuIndex=%d opCount=%d firstOp=%d\n",
+                          inputIndex, i, npuIndex, (int)subModulesInfo[i].opList.size(),
+                          subModulesInfo[i].opList.empty() ? -1 : subModulesInfo[i].opList[0]);
                 auto path = gCacheDir + "/" + gGraphName + std::to_string(npuIndex);
                 if (!gOfflieDst.empty()) {
                     path += ("." + gOfflieDst);
@@ -1128,6 +1153,7 @@ int main(int argc, const char* argv[]) {
                     merges.insert(std::make_pair(path, std::vector<std::string>{srcPath}));
                 }
                 npuOps[i] = std::move(_compileSubModule(moduleIO[i], subModulesInfo[i], bufferPair.first, bufferPair.second, srcPath, srcMNN, path, cpuTotal, npuTotal, inputIndex, graphicName));
+                MNN_PRINT("Compile submodule done inputIndex=%d moduleIndex=%d npuIndex=%d\n", inputIndex, i, npuIndex);
                 npuIndex++;
             }
         }
@@ -1135,6 +1161,9 @@ int main(int argc, const char* argv[]) {
         // Merge to dst
         std::shared_ptr<MNN::NetT> dstNet(flatbuffers::GetRoot<Net>(bufferPair.first)->UnPack());
         for (int i=0; i<keepOp.size(); ++i) {
+            if (nullptr == dstNet->oplists[i].get()) {
+                continue;
+            }
             if (dstNet->oplists[i]->inputIndexes.empty()) {
                 continue;
             }
@@ -1146,6 +1175,14 @@ int main(int argc, const char* argv[]) {
             auto moduleInfo = subModulesInfo[moduleIndex];
             if (moduleInfo.isBreak) {
                 continue;
+            }
+            if (moduleInfo.opList.empty()) {
+                MNN_ERROR("Empty submodule oplist at moduleIndex=%d\n", moduleIndex);
+                continue;
+            }
+            if (nullptr == npuOps[moduleIndex].get()) {
+                MNN_ERROR("Compile submodule failed at moduleIndex=%d, first op index=%d\n", moduleIndex, moduleInfo.opList[0]);
+                return 1;
             }
             for (auto& index : moduleInfo.opList) {
                 dstNet->oplists[index].reset();
