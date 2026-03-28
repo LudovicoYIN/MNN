@@ -10,10 +10,14 @@
 #include "core/MNNFileUtils.h"
 #include "QnnTypeMacros.hpp"
 #include "HTP/QnnHtpContext.h"
+#include "dsprpc_interface.h"
 // #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
 #include "core/FileLoader.hpp"
+#include <cstdlib>
+#include <mutex>
 #include <sstream>
+#include <unordered_map>
 // #define QNN_PROFILE_OP
 // #define QNN_PROFILE_SUMMARIZE
 // #define QNN_VERBOSE
@@ -26,6 +30,92 @@
 namespace MNN {
 static std::string gExtraIoPrefix = "_mnn";
 namespace QNN {
+
+class OnlineRPCBuffer {
+public:
+    ~OnlineRPCBuffer() {
+        if (mPtr != nullptr) {
+            if (mUseRpcMem) {
+                rpcmem_free(mPtr);
+            } else {
+                ::free(mPtr);
+            }
+        }
+    }
+
+    static std::shared_ptr<OnlineRPCBuffer> alloc(size_t size) {
+        void* data = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED, size);
+        bool useRpcMem = data != nullptr;
+        if (!useRpcMem) {
+            MNN_PRINT("MNN_QNN: rpcmem_alloc unavailable for extra state buffer, fallback to host buffer, size=%zu\n", size);
+            data = ::malloc(size);
+            if (data == nullptr) {
+                MNN_ERROR("host malloc failed for extra state buffer, size=%zu\n", size);
+                return nullptr;
+            }
+        }
+        int fd = -1;
+        if (useRpcMem) {
+            fd = rpcmem_to_fd(data);
+            if (fd == -1) {
+                MNN_ERROR("rpcmem_to_fd failed for extra state buffer, size=%zu\n", size);
+                rpcmem_free(data);
+                return nullptr;
+            }
+        }
+        return std::shared_ptr<OnlineRPCBuffer>(new OnlineRPCBuffer(data, fd, size, useRpcMem));
+    }
+
+    bool bind(Qnn_Tensor_t* tensor, QNN_INTERFACE_VER_TYPE* interface, Qnn_ContextHandle_t context) {
+        if (!mUseRpcMem) {
+            QNN_TENSOR_SET_MEM_TYPE(tensor, QNN_TENSORMEMTYPE_RAW);
+            Qnn_ClientBuffer_t clientBuf = {mPtr, static_cast<uint32_t>(mSize)};
+            QNN_TENSOR_SET_CLIENT_BUF(tensor, clientBuf);
+            return true;
+        }
+        if (!mRegistered) {
+            Qnn_MemDescriptor_t memDescriptor = {
+                {QNN_TENSOR_GET_RANK(tensor), QNN_TENSOR_GET_DIMENSIONS(tensor), nullptr},
+                QNN_TENSOR_GET_DATA_TYPE(tensor),
+                QNN_MEM_TYPE_ION,
+                {{-1}}};
+            memDescriptor.ionInfo.fd = mFd;
+            auto res = interface->memRegister(context, &memDescriptor, 1, &mHandle);
+            if (res != QNN_SUCCESS) {
+                MNN_ERROR("memRegister failed for extra state tensor %s, error=%llu\n",
+                          QNN_TENSOR_GET_NAME(tensor), (unsigned long long)res);
+                return false;
+            }
+            mRegistered = true;
+        }
+        QNN_TENSOR_SET_MEM_TYPE(tensor, QNN_TENSORMEMTYPE_MEMHANDLE);
+        QNN_TENSOR_SET_MEM_HANDLE(tensor, mHandle);
+        return true;
+    }
+
+    void zero() {
+        if (mPtr != nullptr) {
+            ::memset(mPtr, 0, mSize);
+        }
+    }
+
+    void* ptr() const {
+        return mPtr;
+    }
+
+private:
+    OnlineRPCBuffer(void* ptr, int fd, size_t size, bool useRpcMem) : mPtr(ptr), mFd(fd), mSize(size), mUseRpcMem(useRpcMem) {
+    }
+
+private:
+    void* mPtr = nullptr;
+    int mFd = -1;
+    size_t mSize = 0;
+    bool mUseRpcMem = false;
+    bool mRegistered = false;
+    Qnn_MemHandle_t mHandle = nullptr;
+};
+
 struct QnnContext {
     QNN_INTERFACE_VER_TYPE interface{};
     QNN_SYSTEM_INTERFACE_VER_TYPE systemInterface{};
@@ -436,14 +526,24 @@ static bool computeIndex(PluginContext* ctx, int & index) {
         MNN_ERROR("MNN_QNN: Incorrect Plugin Op, can't find 'allInputShape' attr.\n");
         return false;
     }
+    bool dumpShape = (::getenv("MNN_QNN_DUMP_PLUGIN_SHAPE") != nullptr);
     int dimSum = 0;
-    // MNN_PRINT("All Inputs Begin\n");
     for (int i = 0; i < inputs.size(); i++) {
-        // inputs[i]->printShape();
         auto inputDim = inputs[i]->dimensions();
         dimSum += inputDim;
+        if (dumpShape) {
+            std::ostringstream os;
+            os << "[";
+            for (int j = 0; j < inputDim; ++j) {
+                if (j > 0) {
+                    os << ",";
+                }
+                os << inputs[i]->length(j);
+            }
+            os << "]";
+            MNN_ERROR("MNN_QNN_SHAPE input[%d]=%s dims=%d\n", i, os.str().c_str(), inputDim);
+        }
     }
-    // MNN_PRINT("All Inputs End\n");
     if (0 == dimSum) {
         // Scalar
         index = 0;
@@ -452,6 +552,18 @@ static bool computeIndex(PluginContext* ctx, int & index) {
     auto indexNumber = attrAllShape->list()->i()->size() / dimSum;
     for (int si=0; si<indexNumber; ++si) {
         auto dstSi = attrAllShape->list()->i()->data() + si * dimSum;
+        if (dumpShape) {
+            std::ostringstream os;
+            os << "[";
+            for (int j = 0; j < dimSum; ++j) {
+                if (j > 0) {
+                    os << ",";
+                }
+                os << dstSi[j];
+            }
+            os << "]";
+            MNN_ERROR("MNN_QNN_SHAPE candidate[%d]=%s\n", si, os.str().c_str());
+        }
         bool valid = true;
         for (int i=0; i<inputs.size(); ++i) {
             auto inputDim = inputs[i]->dimensions();
@@ -468,14 +580,23 @@ static bool computeIndex(PluginContext* ctx, int & index) {
         }
         if (valid) {
             index = si;
+            if (dumpShape) {
+                MNN_ERROR("MNN_QNN_SHAPE matched=%d\n", si);
+            }
             return true;
         }
+    }
+    if (dumpShape) {
+        MNN_ERROR("MNN_QNN_SHAPE no_match dimSum=%d candidates=%d\n", dimSum, indexNumber);
     }
     return false;
 }
 
 bool PluginShapeRaw::compute(InferShapeContext* ctx) {
     if (ctx->hasAttr("op")) {
+        if (::getenv("MNN_QNN_DUMP_PLUGIN_SHAPE") != nullptr) {
+            MNN_ERROR("MNN_QNN_SHAPE using_embedded_op_shape=1\n");
+        }
         auto attr = ctx->getAttr("op");
         if (nullptr != attr->tensor() && nullptr != attr->tensor()->int8s()) {
             auto realop = flatbuffers::GetRoot<Op>(attr->tensor()->int8s()->data());
@@ -845,14 +966,21 @@ private:
     std::unique_ptr<QNN::QNNPerf> mPerf;
     void _rebuildContextConfigs(bool enableIoMemEstimation) {
         int configCount = 0;
-        mQnnHtpContextCustomConfigs[configCount] = QNN_HTP_CONTEXT_CUSTOM_CONFIG_INIT;
-        mQnnHtpContextCustomConfigs[configCount].option = QNN_HTP_CONTEXT_CONFIG_OPTION_WEIGHT_SHARING_ENABLED;
-        mQnnHtpContextCustomConfigs[configCount].weightSharingEnabled = true;
-        mQnnContextConfigStorage[configCount] = QNN_CONTEXT_CONFIG_INIT;
-        mQnnContextConfigStorage[configCount].option = QNN_CONTEXT_CONFIG_OPTION_CUSTOM;
-        mQnnContextConfigStorage[configCount].customConfig = &mQnnHtpContextCustomConfigs[configCount];
-        mQnnContextConfigList[configCount] = &mQnnContextConfigStorage[configCount];
-        ++configCount;
+        bool enableWeightSharing = false;
+        auto weightSharingEnv = ::getenv("MNN_QNN_ENABLE_WEIGHT_SHARING");
+        if (weightSharingEnv != nullptr && weightSharingEnv[0] != '\0' && weightSharingEnv[0] != '0') {
+            enableWeightSharing = true;
+        }
+        if (enableWeightSharing) {
+            mQnnHtpContextCustomConfigs[configCount] = QNN_HTP_CONTEXT_CUSTOM_CONFIG_INIT;
+            mQnnHtpContextCustomConfigs[configCount].option = QNN_HTP_CONTEXT_CONFIG_OPTION_WEIGHT_SHARING_ENABLED;
+            mQnnHtpContextCustomConfigs[configCount].weightSharingEnabled = true;
+            mQnnContextConfigStorage[configCount] = QNN_CONTEXT_CONFIG_INIT;
+            mQnnContextConfigStorage[configCount].option = QNN_CONTEXT_CONFIG_OPTION_CUSTOM;
+            mQnnContextConfigStorage[configCount].customConfig = &mQnnHtpContextCustomConfigs[configCount];
+            mQnnContextConfigList[configCount] = &mQnnContextConfigStorage[configCount];
+            ++configCount;
+        }
         if (enableIoMemEstimation) {
             mQnnHtpContextCustomConfigs[configCount] = QNN_HTP_CONTEXT_CUSTOM_CONFIG_INIT;
             mQnnHtpContextCustomConfigs[configCount].option = QNN_HTP_CONTEXT_CONFIG_OPTION_IO_MEM_ESTIMATION;
@@ -1158,7 +1286,7 @@ private:
         int reshapeIndex = -1;
         Kind kind = NONE;
     };
-    std::unique_ptr<RawExecutorWrapper> mRawExecutor;
+    std::shared_ptr<RawExecutorWrapper> mRawExecutor;
     std::vector<std::pair<const MNN::Tensor *, std::string>> mInputs;
     std::vector<std::pair<const MNN::Tensor *, std::string>> mOutputs;
     std::vector<std::string> mOutputAliases;
@@ -1166,6 +1294,48 @@ private:
     std::vector<std::shared_ptr<MNN::Tensor>> mRealOutputs;
     std::vector<SyntheticOutput> mSyntheticOutputs;
     int mShapeIndex;
+    std::string mBinaryPath;
+    size_t mBinaryOffset = 0;
+    size_t mBinarySize = 0;
+    std::vector<std::string> mAllGraphName;
+    static std::mutex& _executorCacheMutex() {
+        static std::mutex mutex;
+        return mutex;
+    }
+    static std::unordered_map<std::string, std::weak_ptr<RawExecutorWrapper>>& _executorCache() {
+        static std::unordered_map<std::string, std::weak_ptr<RawExecutorWrapper>> cache;
+        return cache;
+    }
+    static std::unordered_map<std::string, std::shared_ptr<RPCBuffer>>& _replaceStateCache() {
+        static std::unordered_map<std::string, std::shared_ptr<RPCBuffer>> cache;
+        return cache;
+    }
+    std::string _executorCacheKey() const {
+        return mBinaryPath + "#" + std::to_string(mBinaryOffset) + "#" + std::to_string(mBinarySize);
+    }
+    std::string _stateCacheKey(int index) const {
+        return _executorCacheKey() + "#state#" + std::to_string(index);
+    }
+    static std::string _normalizePath(const std::string& path) {
+        std::string normalized;
+        normalized.reserve(path.size());
+        bool prevSlash = false;
+        for (char c : path) {
+            if (c == '/') {
+                if (prevSlash) {
+                    continue;
+                }
+                prevSlash = true;
+            } else {
+                prevSlash = false;
+            }
+            normalized.push_back(c);
+        }
+        while (normalized.size() > 2 && normalized.compare(0, 2, "./") == 0) {
+            normalized.erase(0, 2);
+        }
+        return normalized;
+    }
 
     struct StateTensor {
         enum Mode {
@@ -1179,6 +1349,8 @@ private:
         Mode mode = APPEND;
         int inside;
         int outside;
+        Qnn_DataType_t dataType = QNN_DATATYPE_FLOAT_16;
+        int elementBytes = sizeof(int16_t);
         std::vector<std::shared_ptr<RPCBuffer>> update;
     };
     std::vector<StateTensor> mStateInput;
@@ -1186,7 +1358,250 @@ private:
     int mStateMaxSize = 0;
     std::vector<int> mSeqLen;
     std::shared_ptr<RPCBuffer> mMask;
+    int mLastStateMetaDumpShapeIndex = -1;
     const float mMinValue = -32700.0f;
+    bool _shouldReleaseExecutorPerRun() const {
+        auto enabled = ::getenv("MNN_QNN_PLUGIN_RELEASE_CONTEXT_EACH_RUN");
+        return enabled != nullptr && enabled[0] != '\0' && enabled[0] != '0';
+    }
+    bool _shouldDumpGraphIo(const std::string& graphName) const {
+        auto enabled = ::getenv("MNN_QNN_DUMP_PLUGIN_IO");
+        if (enabled == nullptr || enabled[0] == '\0' || enabled[0] == '0') {
+            return false;
+        }
+        auto match = ::getenv("MNN_QNN_DUMP_PLUGIN_MATCH");
+        if (match == nullptr || match[0] == '\0') {
+            return true;
+        }
+        return graphName.find(match) != std::string::npos;
+    }
+    bool _shouldDumpGraphState(const std::string& graphName) const {
+        auto enabled = ::getenv("MNN_QNN_DUMP_PLUGIN_STATE");
+        if (enabled == nullptr || enabled[0] == '\0') {
+            return _shouldDumpGraphIo(graphName);
+        }
+        if (enabled[0] == '0') {
+            return false;
+        }
+        auto match = ::getenv("MNN_QNN_DUMP_PLUGIN_MATCH");
+        if (match == nullptr || match[0] == '\0') {
+            return true;
+        }
+        return graphName.find(match) != std::string::npos;
+    }
+    static int _computeElementCount(const std::vector<int>& shape) {
+        if (shape.empty()) {
+            return 0;
+        }
+        int count = 1;
+        for (auto dim : shape) {
+            count *= dim;
+        }
+        return count;
+    }
+    static std::string _shapeString(const std::vector<int>& shape) {
+        std::ostringstream os;
+        os << "[";
+        for (int i = 0; i < shape.size(); ++i) {
+            if (i > 0) {
+                os << ",";
+            }
+            os << shape[i];
+        }
+        os << "]";
+        return os.str();
+    }
+    static const char* _stateModeString(StateTensor::Mode mode) {
+        return mode == StateTensor::REPLACE ? "replace" : "append";
+    }
+    static int _qnnDataTypeBytes(Qnn_DataType_t dataType) {
+        switch (dataType) {
+            case QNN_DATATYPE_FLOAT_16:
+                return sizeof(int16_t);
+            case QNN_DATATYPE_FLOAT_32:
+                return sizeof(float);
+            default:
+                return 0;
+        }
+    }
+    static int16_t _floatToHalfBits(float value) {
+        int16_t bits = 0;
+        FLOAT_TO_HALF(&value, &bits, 1);
+        return bits;
+    }
+    static void _printFloatStats(const char* phase, const std::string& graphName, const std::string& name,
+                                 const std::string& alias, const float* ptr, int size) {
+        if (ptr == nullptr || size <= 0) {
+            MNN_PRINT("MNN_QNN_DUMP %s graph=%s name=%s alias=%s float32 unavailable size=%d\n",
+                      phase, graphName.c_str(), name.c_str(), alias.c_str(), size);
+            return;
+        }
+        double minValue = ptr[0];
+        double maxValue = ptr[0];
+        double maxAbs = std::fabs((double)ptr[0]);
+        double sumAbs = 0.0;
+        for (int i = 0; i < size; ++i) {
+            double value = ptr[i];
+            minValue = std::min(minValue, value);
+            maxValue = std::max(maxValue, value);
+            maxAbs = std::max(maxAbs, std::fabs(value));
+            sumAbs += std::fabs(value);
+        }
+        MNN_PRINT("MNN_QNN_DUMP %s graph=%s name=%s alias=%s dtype=float32 size=%d min=%f max=%f meanAbs=%f maxAbs=%f first=",
+                  phase, graphName.c_str(), name.c_str(), alias.c_str(), size, minValue, maxValue, sumAbs / size, maxAbs);
+        int limit = std::min(size, 8);
+        for (int i = 0; i < limit; ++i) {
+            MNN_PRINT("%s%f", i == 0 ? "" : ",", ptr[i]);
+        }
+        MNN_PRINT("\n");
+    }
+    static void _printHalfStats(const char* phase, const std::string& graphName, const std::string& name,
+                                const std::string& alias, const int16_t* ptr, int size) {
+        if (ptr == nullptr || size <= 0) {
+            MNN_PRINT("MNN_QNN_DUMP %s graph=%s name=%s alias=%s float16 unavailable size=%d\n",
+                      phase, graphName.c_str(), name.c_str(), alias.c_str(), size);
+            return;
+        }
+        std::vector<float> values(size);
+        HALF_TO_FLOAT(ptr, values.data(), size);
+        double first = values[0];
+        double minValue = first;
+        double maxValue = first;
+        double maxAbs = std::fabs(first);
+        double sumAbs = 0.0;
+        for (int i = 0; i < size; ++i) {
+            double value = values[i];
+            minValue = std::min(minValue, value);
+            maxValue = std::max(maxValue, value);
+            maxAbs = std::max(maxAbs, std::fabs(value));
+            sumAbs += std::fabs(value);
+        }
+        MNN_PRINT("MNN_QNN_DUMP %s graph=%s name=%s alias=%s dtype=float16 size=%d min=%f max=%f meanAbs=%f maxAbs=%f first=",
+                  phase, graphName.c_str(), name.c_str(), alias.c_str(), size, minValue, maxValue, sumAbs / size, maxAbs);
+        int limit = std::min(size, 8);
+        for (int i = 0; i < limit; ++i) {
+            MNN_PRINT("%s%f", i == 0 ? "" : ",", values[i]);
+        }
+        MNN_PRINT("\n");
+    }
+    static void _printIntStats(const char* phase, const std::string& graphName, const std::string& name,
+                               const std::string& alias, const int* ptr, int size) {
+        if (ptr == nullptr || size <= 0) {
+            MNN_PRINT("MNN_QNN_DUMP %s graph=%s name=%s alias=%s int32 unavailable size=%d\n",
+                      phase, graphName.c_str(), name.c_str(), alias.c_str(), size);
+            return;
+        }
+        int minValue = ptr[0];
+        int maxValue = ptr[0];
+        for (int i = 1; i < size; ++i) {
+            minValue = std::min(minValue, ptr[i]);
+            maxValue = std::max(maxValue, ptr[i]);
+        }
+        MNN_PRINT("MNN_QNN_DUMP %s graph=%s name=%s alias=%s dtype=int32 size=%d min=%d max=%d first=",
+                  phase, graphName.c_str(), name.c_str(), alias.c_str(), size, minValue, maxValue);
+        int limit = std::min(size, 8);
+        for (int i = 0; i < limit; ++i) {
+            MNN_PRINT("%s%d", i == 0 ? "" : ",", ptr[i]);
+        }
+        MNN_PRINT("\n");
+    }
+    void _dumpTensor(const char* phase, const std::string& graphName, const std::string& name, const std::string& alias,
+                     const MNN::Tensor* tensor) const {
+        if (tensor == nullptr) {
+            MNN_PRINT("MNN_QNN_DUMP %s graph=%s name=%s alias=%s null_tensor\n",
+                      phase, graphName.c_str(), name.c_str(), alias.c_str());
+            return;
+        }
+        auto type = tensor->getType();
+        auto size = tensor->elementSize();
+        if (type.code == halide_type_float && type.bits == 32) {
+            _printFloatStats(phase, graphName, name, alias, tensor->host<float>(), size);
+            return;
+        }
+        if (type.code == halide_type_float && type.bits == 16) {
+            _printHalfStats(phase, graphName, name, alias, tensor->host<int16_t>(), size);
+            return;
+        }
+        if (type.code == halide_type_int && type.bits == 32) {
+            _printIntStats(phase, graphName, name, alias, tensor->host<int>(), size);
+            return;
+        }
+        MNN_PRINT("MNN_QNN_DUMP %s graph=%s name=%s alias=%s dtype_code=%d bits=%d size=%d unsupported\n",
+                  phase, graphName.c_str(), name.c_str(), alias.c_str(), (int)type.code, (int)type.bits, size);
+    }
+    void _dumpGraphInputs(const std::string& graphName) const {
+        for (int i = 0; i < mInputs.size(); ++i) {
+            auto tensor = i < mRealInputs.size() ? mRealInputs[i].get() : nullptr;
+            _dumpTensor("input", graphName, mInputs[i].second, mInputs[i].second, tensor);
+        }
+    }
+    void _dumpGraphOutputs(const std::string& graphName) const {
+        for (int i = 0; i < mOutputs.size(); ++i) {
+            auto tensor = i < mRealOutputs.size() ? mRealOutputs[i].get() : nullptr;
+            std::string alias = i < mOutputAliases.size() ? mOutputAliases[i] : mOutputs[i].second;
+            _dumpTensor("output", graphName, mOutputs[i].second, alias, tensor);
+        }
+    }
+    void _dumpStateMeta(const std::string& graphName, int shapeIndex) const {
+        int seqLen = shapeIndex >= 0 && shapeIndex < mSeqLen.size() ? mSeqLen[shapeIndex] : -1;
+        MNN_PRINT("MNN_QNN_DUMP state_meta graph=%s shapeIndex=%d seqLen=%d stateCount=%d stateCurrent=%d stateMaxSize=%d\n",
+                  graphName.c_str(), shapeIndex, seqLen, (int)mStateInput.size(), mStateCurrent, mStateMaxSize);
+        for (int i = 0; i < mStateInput.size(); ++i) {
+            const auto& input = mStateInput[i];
+            int elementCount = _computeElementCount(input.shape);
+            int storageCount = input.mode == StateTensor::APPEND ? input.maxSize * input.inside * input.outside : elementCount;
+            MNN_PRINT("MNN_QNN_DUMP state_meta graph=%s index=%d mode=%s shape=%s axis=%d max=%d inside=%d outside=%d elementCount=%d storageCount=%d\n",
+                      graphName.c_str(), i, _stateModeString(input.mode), _shapeString(input.shape).c_str(), input.axis,
+                      input.maxSize, input.inside, input.outside, elementCount, storageCount);
+        }
+        if (mMask != nullptr && mStateMaxSize > 0) {
+            _printHalfStats("state_mask", graphName, gExtraIoPrefix + "_mask", "state_mask",
+                            reinterpret_cast<const int16_t*>(mMask->mPtr), mStateMaxSize);
+        }
+    }
+    void _dumpStateBuffers(const char* phase, const std::string& graphName, int shapeIndex, bool useUpdateBuffer,
+                           int appendTokenCount) const {
+        for (int i = 0; i < mStateInput.size(); ++i) {
+            const auto& input = mStateInput[i];
+            const RPCBuffer* buffer = input.data.get();
+            if (useUpdateBuffer) {
+                if (shapeIndex < 0 || shapeIndex >= input.update.size()) {
+                    MNN_PRINT("MNN_QNN_DUMP %s graph=%s name=state[%d] alias=missing_update_buffer shapeIndex=%d\n",
+                              phase, graphName.c_str(), i, shapeIndex);
+                    continue;
+                }
+                buffer = input.update[shapeIndex].get();
+            }
+            int elementCount = _computeElementCount(input.shape);
+            int storageCount = input.mode == StateTensor::APPEND ? input.maxSize * input.inside * input.outside : elementCount;
+            int validCount = elementCount;
+            if (input.mode == StateTensor::APPEND) {
+                int tokens = std::max(0, appendTokenCount);
+                if (input.maxSize > 0) {
+                    tokens = std::min(tokens, input.maxSize);
+                }
+                validCount = tokens * input.inside * input.outside;
+            }
+            std::ostringstream alias;
+            alias << "mode=" << _stateModeString(input.mode)
+                  << ",dtype=" << input.dataType
+                  << ",shape=" << _shapeString(input.shape)
+                  << ",axis=" << input.axis
+                  << ",max=" << input.maxSize
+                  << ",inside=" << input.inside
+                  << ",outside=" << input.outside
+                  << ",valid=" << validCount
+                  << ",storage=" << storageCount
+                  << ",buffer=" << (useUpdateBuffer ? "update" : "store");
+            if (input.dataType == QNN_DATATYPE_FLOAT_32) {
+                _printFloatStats(phase, graphName, "state[" + std::to_string(i) + "]", alias.str(),
+                                 buffer == nullptr ? nullptr : reinterpret_cast<const float*>(buffer->mPtr), validCount);
+            } else {
+                _printHalfStats(phase, graphName, "state[" + std::to_string(i) + "]", alias.str(),
+                                buffer == nullptr ? nullptr : reinterpret_cast<const int16_t*>(buffer->mPtr), validCount);
+            }
+        }
+    }
     static bool _matchSuffix(const std::string& name, const char* suffix) {
         size_t suffixLen = ::strlen(suffix);
         if (name.size() < suffixLen) {
@@ -1268,15 +1683,17 @@ private:
             return;
         }
         if (mStateMaxSize > 0) {
-            mMask.reset(RPCBuffer::alloc(mStateMaxSize * sizeof(__fp16)));
-            auto maskPtr = (__fp16*)mMask->mPtr;
+            mMask.reset(RPCBuffer::alloc(mStateMaxSize * sizeof(int16_t)));
+            auto maskPtr = reinterpret_cast<int16_t*>(mMask->mPtr);
+            auto minValueHalf = _floatToHalfBits(mMinValue);
             for (int i=0; i<mStateMaxSize; ++i) {
-                maskPtr[i] = mMinValue;
+                maskPtr[i] = minValueHalf;
             }
         }
         for (int i=0; i<mStateInput.size(); ++i) {
             auto& state = mStateInput[i];
-            int bytes = sizeof(__fp16);
+            int bytes = state.elementBytes;
+            MNN_ASSERT(bytes > 0);
             int elementCount = 1;
             for (auto dim : state.shape) {
                 elementCount *= dim;
@@ -1285,8 +1702,24 @@ private:
             if (state.mode == StateTensor::APPEND) {
                 storageCount = state.maxSize * state.inside * state.outside;
             }
-            state.data.reset(RPCBuffer::alloc(storageCount * bytes));
-            ::memset(state.data->mPtr, 0, storageCount * bytes);
+            if (state.mode == StateTensor::REPLACE) {
+                auto cacheKey = _stateCacheKey(i);
+                {
+                    std::lock_guard<std::mutex> lock(_executorCacheMutex());
+                    auto& cache = _replaceStateCache();
+                    auto it = cache.find(cacheKey);
+                    if (it != cache.end()) {
+                        state.data = it->second;
+                    } else {
+                        state.data.reset(RPCBuffer::alloc(storageCount * bytes));
+                        ::memset(state.data->mPtr, 0, storageCount * bytes);
+                        cache[cacheKey] = state.data;
+                    }
+                }
+            } else {
+                state.data.reset(RPCBuffer::alloc(storageCount * bytes));
+                ::memset(state.data->mPtr, 0, storageCount * bytes);
+            }
             mStateInput[i].update.resize(seqLen.size());
             for (int j=0; j<seqLen.size(); ++j) {
                 int updateCount = elementCount;
@@ -1300,6 +1733,85 @@ private:
                 ::memset(state.update[j]->mPtr, 0, updateCount * bytes);
             }
         }
+    }
+    bool _prepareStateDType() {
+        for (int i = 0; i < mStateInput.size(); ++i) {
+            auto inputTensor = mRawExecutor-> _findInput(gExtraIoPrefix + "_i" + std::to_string(i), 0);
+            if (inputTensor == nullptr) {
+                MNN_ERROR("MNN_QNN: can't find state input tensor %d for dtype init\n", i);
+                return false;
+            }
+            auto bytes = _qnnDataTypeBytes(QNN_TENSOR_GET_DATA_TYPE(inputTensor));
+            if (bytes <= 0) {
+                MNN_ERROR("MNN_QNN: unsupported state dtype=%d for state input %d\n",
+                          (int)QNN_TENSOR_GET_DATA_TYPE(inputTensor), i);
+                return false;
+            }
+            mStateInput[i].dataType = QNN_TENSOR_GET_DATA_TYPE(inputTensor);
+            mStateInput[i].elementBytes = bytes;
+        }
+        return true;
+    }
+    bool _ensureExecutorLoaded() {
+        if (mRawExecutor != nullptr) {
+            return true;
+        }
+        auto key = _executorCacheKey();
+        {
+            std::lock_guard<std::mutex> lock(_executorCacheMutex());
+            auto& cache = _executorCache();
+            auto it = cache.find(key);
+            if (it != cache.end()) {
+                mRawExecutor = it->second.lock();
+                if (mRawExecutor == nullptr) {
+                    cache.erase(it);
+                }
+            }
+            if (mRawExecutor == nullptr) {
+                auto executor = std::make_shared<RawExecutorWrapper>();
+                if (!executor->compileModel(mBinaryPath, mBinaryOffset, mBinarySize, mAllGraphName)) {
+                    return false;
+                }
+                cache[key] = executor;
+                mRawExecutor = executor;
+            }
+        }
+        if (!mStateInput.empty() && (mStateInput[0].data == nullptr || mStateInput[0].update.empty())) {
+            if (!_prepareStateDType()) {
+                return false;
+            }
+            _loadState(mSeqLen);
+        }
+        return true;
+    }
+    bool _bindExecutorTensors(int shapeIndex) {
+        std::vector<std::pair<const MNN::Tensor*, std::string>> qnnOutputs;
+        qnnOutputs.reserve(mOutputs.size());
+        for (int i = 0; i < mOutputs.size(); ++i) {
+            if (_isSyntheticOutputIndex(i)) {
+                continue;
+            }
+            qnnOutputs.emplace_back(mOutputs[i]);
+        }
+        mRawExecutor->setupAddress(mInputs, qnnOutputs, shapeIndex);
+        if (!mStateInput.empty()) {
+            std::vector<RPCBuffer*> states(mStateInput.size());
+            for (int i = 0; i < mStateInput.size(); ++i) {
+                states[i] = mStateInput[i].data.get();
+            }
+            std::vector<RPCBuffer*> statesOutput(mStateInput.size());
+            for (int i = 0; i < mStateInput.size(); ++i) {
+                statesOutput[i] = mStateInput[i].update[shapeIndex].get();
+            }
+            if (!mRawExecutor->setupState(mMask.get(), states, statesOutput, shapeIndex)) {
+                MNN_ERROR("MNN_QNN: Failed to bind plugin state tensors for graph index %d.\n", shapeIndex);
+                return false;
+            }
+        }
+        return true;
+    }
+    void _releaseExecutor() {
+        mRawExecutor.reset();
     }
 
 public:
@@ -1424,22 +1936,20 @@ public:
                 }
             }
         }
-        _loadState(mSeqLen);
         auto path = MNNFilePathConcat(ctx->dir_path(), ctx->getAttr("path")->s()->str());
+        mBinaryPath = _normalizePath(path);
 
-        std::vector<std::string> allGraphName;
         auto allGraphNameAttr = ctx->getAttr("allGraphName");
         if (allGraphNameAttr && allGraphNameAttr->list() && allGraphNameAttr->list()->s()) {
             auto graphNames = allGraphNameAttr->list()->s();
             for (int i = 0; i < graphNames->size(); ++i) {
-                allGraphName.push_back(graphNames->GetAsString(i)->str());
+                mAllGraphName.push_back(graphNames->GetAsString(i)->str());
             }
         } else {
             MNN_ERROR("MNN_QNN: Incorrect Plugin Op, can't find 'allGraphName' attr.\n");
             return false;
         }
 
-        size_t binaryOffset = 0;
         auto offsetAttr = ctx->getAttr("offset");
         if (offsetAttr && offsetAttr->list() && offsetAttr->list()->i()->size() == 2) {
             const int * dataPtr = offsetAttr->list()->i()->data();
@@ -1450,10 +1960,9 @@ public:
             ::memcpy(&lowDst, &lowSrc, sizeof(uint32_t));
             ::memcpy(&highDst, &highSrc, sizeof(uint32_t));
 
-            binaryOffset = (static_cast<size_t>(highDst) << 32) | static_cast<size_t>(lowDst);
+            mBinaryOffset = (static_cast<size_t>(highDst) << 32) | static_cast<size_t>(lowDst);
         }
 
-        size_t binarySize = 0;
         auto sizeAttr = ctx->getAttr("size");
         if (sizeAttr && sizeAttr->list() && sizeAttr->list()->i()->size() == 2) {
             const int * dataPtr = sizeAttr->list()->i()->data();
@@ -1464,10 +1973,16 @@ public:
             ::memcpy(&lowDst, &lowSrc, sizeof(uint32_t));
             ::memcpy(&highDst, &highSrc, sizeof(uint32_t));
 
-            binarySize = (static_cast<size_t>(highDst) << 32) | static_cast<size_t>(lowDst);
+            mBinarySize = (static_cast<size_t>(highDst) << 32) | static_cast<size_t>(lowDst);
         }
-        mRawExecutor.reset(new RawExecutorWrapper());
-        return mRawExecutor->compileModel(path, binaryOffset, binarySize, allGraphName);
+        if (!_ensureExecutorLoaded()) {
+            return false;
+        }
+        if (!_prepareStateDType()) {
+            return false;
+        }
+        _loadState(mSeqLen);
+        return true;
     }
 
     bool resize(CPUKernelContext* ctx) override {
@@ -1508,29 +2023,11 @@ public:
             mOutputs[i].first = mRealOutputs[i].get();
         }
         _prepareSyntheticOutputs();
-        std::vector<std::pair<const MNN::Tensor*, std::string>> qnnOutputs;
-        qnnOutputs.reserve(mOutputs.size());
-        for (int i = 0; i < mOutputs.size(); ++i) {
-            if (_isSyntheticOutputIndex(i)) {
-                continue;
-            }
-            qnnOutputs.emplace_back(mOutputs[i]);
+        if (!_ensureExecutorLoaded()) {
+            return false;
         }
-        mRawExecutor->setupAddress(mInputs, qnnOutputs, mShapeIndex);
-        if (!mStateInput.empty()) {
-            std::vector<RPCBuffer*> states(mStateInput.size());
-            for (int i=0; i<mStateInput.size(); ++i) {
-                states[i] = mStateInput[i].data.get();
-            }
-            std::vector<RPCBuffer*> statesOutput(mStateInput.size());
-            for (int i=0; i<mStateInput.size(); ++i) {
-                statesOutput[i] = mStateInput[i].update[mShapeIndex].get();
-            }
-
-            if (!mRawExecutor->setupState(mMask.get(), states, statesOutput, mShapeIndex)) {
-                MNN_ERROR("MNN_QNN: Failed to bind plugin state tensors for graph index %d.\n", mShapeIndex);
-                return false;
-            }
+        if (!_bindExecutorTensors(mShapeIndex)) {
+            return false;
         }
         return true;
     }
@@ -1539,28 +2036,52 @@ public:
         AUTOTIME;
         int shapeIndex = mShapeIndex;
         std::string graphName = ctx->getAttr("allGraphName")->list()->s()->GetAsString(shapeIndex)->str();
+        if (::getenv("MNN_QNN_TRACE_ENTRY") != nullptr) {
+            MNN_PRINT("MNN_QNN_TRACE plugin_compute graph=%s shapeIndex=%d inputs=%d outputs=%d states=%d\n",
+                      graphName.c_str(), shapeIndex, (int)mInputs.size(), (int)mOutputs.size(), (int)mStateInput.size());
+        }
+        bool dumpGraphIo = _shouldDumpGraphIo(graphName);
+        bool dumpGraphState = _shouldDumpGraphState(graphName);
 
         #ifdef QNN_VERBOSE
         MNN_PRINT("Graph name:%s, %d\n", graphName.c_str(), shapeIndex);
         #endif
         auto inputTensor = ctx->inputs();
         auto outputTensor = ctx->outputs();
+        if (!_ensureExecutorLoaded()) {
+            return false;
+        }
+        if (!_bindExecutorTensors(shapeIndex)) {
+            return false;
+        }
 
         for (int i=0; i<mInputs.size(); ++i) {
             ctx->backend()->onCopyBuffer(inputTensor[i], mRealInputs[i].get());
         }
+        if (dumpGraphIo) {
+            _dumpGraphInputs(graphName);
+        }
         // If has remove, remove invalid state
         auto meta = (KVMeta*)(ctx->backend()->getMetaPtr());
+        if (dumpGraphState && mLastStateMetaDumpShapeIndex != shapeIndex) {
+            _dumpStateMeta(graphName, shapeIndex);
+            mLastStateMetaDumpShapeIndex = shapeIndex;
+        }
+        if (dumpGraphState && meta != nullptr) {
+            MNN_PRINT("MNN_QNN_DUMP state_meta graph=%s meta_add=%zu meta_remove=%zu stateCurrent=%d\n",
+                      graphName.c_str(), meta->add, meta->remove, mStateCurrent);
+        }
         if (nullptr != meta && mMask.get() != nullptr && mStateMaxSize > 0) {
-            auto maskPtr = (__fp16*)mMask->mPtr;
+            auto maskPtr = reinterpret_cast<int16_t*>(mMask->mPtr);
+            auto minValueHalf = _floatToHalfBits(mMinValue);
             if (meta->remove > 0) {
                 if (meta->remove > mStateCurrent) {
-                    MNN_ERROR("QNN: Error: Remove %d larger than current = %d\n", meta->remove, mStateCurrent);
+                    MNN_ERROR("QNN: Error: Remove %zu larger than current = %d\n", meta->remove, mStateCurrent);
                     return false;
                 }
                 mStateCurrent-= meta->remove;
                 for (int i=0; i<meta->remove; ++i) {
-                    maskPtr[i+mStateCurrent] = mMinValue;
+                    maskPtr[i+mStateCurrent] = minValueHalf;
                 }
             }
         }
@@ -1573,11 +2094,18 @@ public:
                 for (auto dim : mStateInput[i].shape) {
                     elementCount *= dim;
                 }
-                ::memset(mStateInput[i].data->mPtr, 0, elementCount * sizeof(__fp16));
+                ::memset(mStateInput[i].data->mPtr, 0, elementCount * mStateInput[i].elementBytes);
             }
         }
         mRawExecutor->invokModel(shapeIndex);
         _fillSyntheticOutputs();
+        if (dumpGraphState) {
+            int seqLen = shapeIndex >= 0 && shapeIndex < mSeqLen.size() ? mSeqLen[shapeIndex] : 0;
+            _dumpStateBuffers("state_update", graphName, shapeIndex, true, seqLen);
+        }
+        if (dumpGraphIo) {
+            _dumpGraphOutputs(graphName);
+        }
         for (int i=0; i<mOutputs.size(); ++i) {
             ctx->backend()->onCopyBuffer(mRealOutputs[i].get(), outputTensor[i]);
         }
@@ -1592,13 +2120,13 @@ public:
                 for (auto dim : input.shape) {
                     elementCount *= dim;
                 }
-                ::memcpy(input.data->mPtr, input.update[mShapeIndex]->mPtr, elementCount * sizeof(__fp16));
+                ::memcpy(input.data->mPtr, input.update[mShapeIndex]->mPtr, elementCount * input.elementBytes);
             }
         }
         if (nullptr != meta && mMask.get() != nullptr && mStateMaxSize > 0) {
-            auto maskPtr = (__fp16*)mMask->mPtr;
+            auto maskPtr = reinterpret_cast<int16_t*>(mMask->mPtr);
             if (meta->add + mStateCurrent > mStateMaxSize) {
-                MNN_ERROR("QNN: Error: KV length %d larger than max size = %d\n", meta->add + mStateCurrent, mStateMaxSize);
+                MNN_ERROR("QNN: Error: KV length %zu larger than max size = %d\n", meta->add + mStateCurrent, mStateMaxSize);
                 return false;
             }
             for (int i=0; i<meta->add; ++i) {
@@ -1615,12 +2143,19 @@ public:
                 for (int y=0; y<input.outside; ++y) {
                     auto dstOffset = y * input.inside * mStateMaxSize + mStateCurrent * input.inside;
                     auto srcOffset = y * input.inside * seqLen;
+                    bytes = input.elementBytes;
                     auto dst = (uint8_t*)input.data->mPtr + dstOffset * bytes;
                     auto src = (uint8_t*)input.update[mShapeIndex]->mPtr + srcOffset * bytes;
                     ::memcpy(dst, src, meta->add * input.inside * bytes);
                 }
             }
             mStateCurrent += meta->add;
+        }
+        if (dumpGraphState) {
+            _dumpStateBuffers("state_store", graphName, shapeIndex, false, mStateCurrent);
+        }
+        if (_shouldReleaseExecutorPerRun()) {
+            _releaseExecutor();
         }
         return true;
     }
@@ -2043,16 +2578,81 @@ void QnnBackend::finalizeGraph() {
 }
 
 void QnnBackend::executeGraph() const {
+    if (::getenv("MNN_QNN_TRACE_ENTRY") != nullptr) {
+        MNN_PRINT("MNN_QNN_TRACE direct_execute graphHandle=%p inputs=%zu outputs=%zu extraInputs=%zu extraOutputs=%zu\n",
+                  mQnnGraphHandle, mInputTensorIndexes.size(), mOutputTensorIndexes.size(), mExtraInputs.size(), mExtraOutputs.size());
+    }
     std::vector<Qnn_Tensor_t> inputs;
     std::vector<Qnn_Tensor_t> outputs;
+    auto dataTypeBytes = [](Qnn_DataType_t dataType) -> size_t {
+        switch (dataType) {
+            case QNN_DATATYPE_FLOAT_16:
+                return sizeof(int16_t);
+            case QNN_DATATYPE_FLOAT_32:
+                return sizeof(float);
+            default:
+                return 0;
+        }
+    };
+    auto dumpTensor = [&](const char* prefix, const Qnn_Tensor_t& tensor, int index) {
+        std::ostringstream os;
+        os << prefix << "[" << index << "]"
+           << " name=" << (tensor.v1.name ? tensor.v1.name : "<null>")
+           << " type=" << tensor.v1.type
+           << " dataType=" << tensor.v1.dataType
+           << " memType=" << tensor.v1.memType
+           << " rank=" << tensor.v1.rank
+           << " dims=[";
+        for (uint32_t i = 0; i < tensor.v1.rank; ++i) {
+            if (i > 0) {
+                os << ",";
+            }
+            os << tensor.v1.dimensions[i];
+        }
+        os << "]";
+        MNN_ERROR("%s\n", os.str().c_str());
+    };
     for (int i = 0; i <  mInputTensorIndexes.size(); i++) {
         inputs.push_back(*(mQNNTensorWrappers[mInputTensorIndexes[i]]->getNativeTensor()));
     }
     for (int j = 0 ; j < mOutputTensorIndexes.size(); j++) {
         outputs.push_back(*(mQNNTensorWrappers[mOutputTensorIndexes[j]]->getNativeTensor()));
     }
+    for (const auto& extraInput : mExtraInputs) {
+        inputs.push_back(*(extraInput->getNativeTensor()));
+    }
+    for (const auto& extraOutput : mExtraOutputs) {
+        outputs.push_back(*(extraOutput->getNativeTensor()));
+    }
 
-    CALL_QNN(mRuntime->mQnnInterface.graphExecute(mQnnGraphHandle, inputs.data(), mInputTensorIndexes.size(), outputs.data(), mOutputTensorIndexes.size(), mQnnProfileHandle, mQnnSignalHandle));
+    auto execCode = mRuntime->mQnnInterface.graphExecute(mQnnGraphHandle, inputs.data(), inputs.size(), outputs.data(), outputs.size(), mQnnProfileHandle, mQnnSignalHandle);
+    if ((execCode & 0xFFFF) != QNN_SUCCESS) {
+        MNN_ERROR("MNN_QNN: graphExecute failed code=%lu inputs=%zu outputs=%zu extraInputs=%zu extraOutputs=%zu\n",
+                  (unsigned long)execCode, inputs.size(), outputs.size(), mExtraInputs.size(), mExtraOutputs.size());
+        for (int i = 0; i < inputs.size(); ++i) {
+            dumpTensor("input", inputs[i], i);
+        }
+        for (int i = 0; i < outputs.size(); ++i) {
+            dumpTensor("output", outputs[i], i);
+        }
+        assert((execCode & 0xFFFF) == QNN_SUCCESS);
+    }
+
+    // Direct QNN execution has no plugin-side state manager, so persist LinearAttention-style
+    // state explicitly by copying each extra output buffer back into its paired extra input.
+    for (int i = 0; i < mExtraInputs.size() && i < mExtraOutputs.size(); ++i) {
+        auto src = mExtraOutputs[i]->getNativeTensor();
+        uint32_t elementSize = 1;
+        for (uint32_t axis = 0; axis < src->v1.rank; ++axis) {
+            elementSize *= src->v1.dimensions[axis];
+        }
+        if (elementSize <= 0) {
+            continue;
+        }
+        auto bytes = static_cast<size_t>(elementSize) * dataTypeBytes(src->v1.dataType);
+        MNN_ASSERT(bytes > 0);
+        ::memcpy(mExtraStateIoBuffers[i]->ptr(), mExtraStateIoBuffers[mExtraInputs.size() + i]->ptr(), bytes);
+    }
 }
 
 void QnnBackend::freeContextAndGraph() {
@@ -2145,19 +2745,44 @@ Qnn_Tensor_t* QnnBackend::getMaskTensor(int maxKVSize) {
     return mMaskTensor->getNativeTensor();
 }
 
-Qnn_Tensor_t* QnnBackend::addExtraInput(Tensor* tensor) {
-    auto qnntensor = QNNTensorWrapper::create("", QNN_TENSOR_TYPE_APP_WRITE, QNN_DATATYPE_FLOAT_16, tensor->shape());
+static size_t _qnnDataTypeBytes(Qnn_DataType_t dataType) {
+    switch (dataType) {
+        case QNN_DATATYPE_FLOAT_16:
+            return sizeof(int16_t);
+        case QNN_DATATYPE_FLOAT_32:
+            return sizeof(float);
+        default:
+            MNN_ASSERT(false);
+            return 0;
+    }
+}
+
+Qnn_Tensor_t* QnnBackend::addExtraInput(Tensor* tensor, Qnn_DataType_t dataType) {
+    auto qnntensor = QNNTensorWrapper::create("", QNN_TENSOR_TYPE_APP_WRITE, dataType, tensor->shape());
     qnntensor->setName(gExtraIoPrefix+"_i" + std::to_string(mExtraInputs.size()));
     qnntensor->getNativeTensor()->v1.memType = QNN_TENSORMEMTYPE_MEMHANDLE;
+    auto bytes = (size_t)std::max(1, tensor->elementSize()) * _qnnDataTypeBytes(dataType);
+    auto buffer = OnlineRPCBuffer::alloc(bytes);
+    MNN_ASSERT(buffer != nullptr);
+    buffer->zero();
+    MNN_ASSERT(buffer->bind(qnntensor->getNativeTensor(), &mRuntime->mQnnInterface, mRuntime->mQnnContextHandle));
+    mExtraStateBuffers[tensor] = buffer;
+    mExtraStateIoBuffers.emplace_back(buffer);
     mExtraInputs.emplace_back(qnntensor);
     CALL_QNN(mRuntime->mQnnInterface.tensorCreateGraphTensor(mQnnGraphHandle, qnntensor->getNativeTensor()));
 
     return qnntensor->getNativeTensor();
 }
-Qnn_Tensor_t* QnnBackend::addExtraOutput(Tensor* tensor) {
-    auto qnntensor = QNNTensorWrapper::create("", QNN_TENSOR_TYPE_APP_READ, QNN_DATATYPE_FLOAT_16, tensor->shape());
+Qnn_Tensor_t* QnnBackend::addExtraOutput(Tensor* tensor, Qnn_DataType_t dataType) {
+    auto qnntensor = QNNTensorWrapper::create("", QNN_TENSOR_TYPE_APP_READ, dataType, tensor->shape());
     qnntensor->setName(gExtraIoPrefix+"_o" + std::to_string(mExtraOutputs.size()));
     qnntensor->getNativeTensor()->v1.memType = QNN_TENSORMEMTYPE_MEMHANDLE;
+    auto bytes = (size_t)std::max(1, tensor->elementSize()) * _qnnDataTypeBytes(dataType);
+    auto buffer = OnlineRPCBuffer::alloc(bytes);
+    MNN_ASSERT(buffer != nullptr);
+    buffer->zero();
+    mExtraStateIoBuffers.emplace_back(buffer);
+    MNN_ASSERT(buffer->bind(qnntensor->getNativeTensor(), &mRuntime->mQnnInterface, mRuntime->mQnnContextHandle));
     mExtraOutputs.emplace_back(qnntensor);
     CALL_QNN(mRuntime->mQnnInterface.tensorCreateGraphTensor(mQnnGraphHandle, qnntensor->getNativeTensor()));
     return qnntensor->getNativeTensor();
@@ -2181,6 +2806,10 @@ void QnnBackend::clean() {
     mDeQuantOutputTensorMap.clear();
     mInputCastTensorMap.clear();
     mOutputCastTensorMap.clear();
+    mExtraInputs.clear();
+    mExtraOutputs.clear();
+    mExtraStateBuffers.clear();
+    mExtraStateIoBuffers.clear();
 }
 void QnnBackend::buildOutputDequant(){
     Qnn_OpConfigVersion_t mOpConfigVersion = QNN_OPCONFIG_VERSION_1;

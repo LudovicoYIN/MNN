@@ -35,6 +35,7 @@ namespace MNN {
 namespace QNN {
 #ifdef ENABLE_QNN_ONLINE_FINALIZE
 
+class OnlineRPCBuffer;
 class QnnRuntime;
 
 class QnnBackend : public Backend {
@@ -74,8 +75,8 @@ public:
     void addNodeToGraph(Qnn_OpConfigVersion_t version, const char* nodeName, const char* packageName, const char* nodeType, std::vector<Qnn_Param_t> & params, std::vector<Qnn_Tensor_t> & inputs, std::vector<Qnn_Tensor_t> & outputs);
     void addTensor(Qnn_Tensor_t * tensor);
     Qnn_Tensor_t* getMaskTensor(int maxKVSize);
-    Qnn_Tensor_t* addExtraInput(Tensor* tensor);
-    Qnn_Tensor_t* addExtraOutput(Tensor* tensor);
+    Qnn_Tensor_t* addExtraInput(Tensor* tensor, Qnn_DataType_t dataType = QNN_DATATYPE_FLOAT_16);
+    Qnn_Tensor_t* addExtraOutput(Tensor* tensor, Qnn_DataType_t dataType = QNN_DATATYPE_FLOAT_16);
     int getTensorIdx(const Tensor * tensor) const;
     Qnn_Tensor_t * getNativeTensor(const Tensor * tensor);
     std::shared_ptr<QNNTensorWrapper> getTensorWrapper(const Tensor * tensor);
@@ -128,6 +129,8 @@ private:
     std::shared_ptr<QNNTensorWrapper> mMaskTensor;
     std::vector<std::shared_ptr<QNNTensorWrapper>> mExtraInputs;
     std::vector<std::shared_ptr<QNNTensorWrapper>> mExtraOutputs;
+    std::map<const Tensor*, std::shared_ptr<OnlineRPCBuffer>> mExtraStateBuffers;
+    std::vector<std::shared_ptr<OnlineRPCBuffer>> mExtraStateIoBuffers;
 };
 
 

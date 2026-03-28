@@ -12,6 +12,8 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <atomic>
+#include "half.hpp"
 #include "CPULinearAttention.hpp"
 #include "CPUBackend.hpp"
 #include "compute/CommonOptFunction.h"
@@ -24,6 +26,62 @@
 #include "compute/ConvolutionTiledExecutor.hpp"
 
 namespace MNN {
+
+namespace {
+static std::atomic<int> gLinearAttentionDebugId{0};
+
+static bool shouldDumpLinearAttentionState() {
+    auto enabled = ::getenv("MNN_CPU_DUMP_LINEAR_ATTENTION_STATE");
+    return enabled != nullptr && enabled[0] != '\0' && enabled[0] != '0';
+}
+
+static bool shouldForceLinearAttentionFp16() {
+    auto enabled = ::getenv("MNN_CPU_LINEAR_ATTENTION_FORCE_FP16");
+    return enabled != nullptr && enabled[0] != '\0' && enabled[0] != '0';
+}
+
+static float roundToFp16(float value) {
+    return static_cast<float>(half_float::half(value));
+}
+
+static void roundBufferToFp16(float* data, int size) {
+    for (int i = 0; i < size; ++i) {
+        data[i] = roundToFp16(data[i]);
+    }
+}
+
+static void dumpTensorStats(const char* phase, int instanceId, const char* name, const Tensor* tensor) {
+    if (tensor == nullptr) {
+        MNN_PRINT("MNN_CPU_LINEAR_ATTN %s id=%d name=%s null_tensor\n", phase, instanceId, name);
+        return;
+    }
+    auto type = tensor->getType();
+    if (type.code != halide_type_float || type.bits != 32) {
+        MNN_PRINT("MNN_CPU_LINEAR_ATTN %s id=%d name=%s dtype_code=%d bits=%d unsupported\n",
+                  phase, instanceId, name, (int)type.code, (int)type.bits);
+        return;
+    }
+    auto ptr = tensor->host<float>();
+    int size = tensor->elementSize();
+    if (ptr == nullptr || size <= 0) {
+        MNN_PRINT("MNN_CPU_LINEAR_ATTN %s id=%d name=%s unavailable size=%d\n", phase, instanceId, name, size);
+        return;
+    }
+    double minValue = ptr[0];
+    double maxValue = ptr[0];
+    double maxAbs = std::fabs((double)ptr[0]);
+    double sumAbs = 0.0;
+    for (int i = 0; i < size; ++i) {
+        double value = ptr[i];
+        minValue = std::min(minValue, value);
+        maxValue = std::max(maxValue, value);
+        maxAbs = std::max(maxAbs, std::fabs(value));
+        sumAbs += std::fabs(value);
+    }
+    MNN_PRINT("MNN_CPU_LINEAR_ATTN %s id=%d name=%s size=%d min=%f max=%f meanAbs=%f maxAbs=%f\n",
+              phase, instanceId, name, size, minValue, maxValue, sumAbs / size, maxAbs);
+}
+}
 
 
 ErrorCode CPULinearAttention::onResize(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
@@ -349,6 +407,10 @@ ErrorCode CPULinearAttention::onExecute(const std::vector<Tensor*>& inputs, cons
     } else {
         gated_delta_rule_mnn(inputs, outputs);
     }
+    if (shouldDumpLinearAttentionState()) {
+        dumpTensorStats("state", mDebugInstanceId, "conv_state", mStateCache->mConvState.get());
+        dumpTensorStats("state", mDebugInstanceId, "recurrent_state", mStateCache->mRecurrentState.get());
+    }
     return NO_ERROR;
 }
 
@@ -380,6 +442,7 @@ void CPULinearAttention::gated_delta_rule_mnn(const std::vector<Tensor*>& inputs
     const bool useL2Norm = mUseQKL2Norm;
     const int gqa_factor = (H_v > H_k) ? (H_v / H_k) : 1;
     const int H = H_v;
+    const bool forceFp16 = shouldForceLinearAttentionFp16();
 
     // Get pre-allocated buffers
     float* convPadded = mConvPadded->host<float>();
@@ -420,6 +483,9 @@ void CPULinearAttention::gated_delta_rule_mnn(const std::vector<Tensor*>& inputs
             const float* newState = padded + (totalLen - convStateSize);
             float* dstState = convStatePtr + idx * convStateSize;
             ::memcpy(dstState, newState, convStateSize * sizeof(float));
+            if (forceFp16) {
+                roundBufferToFp16(dstState, convStateSize);
+            }
 
             // 1d. SiLU activation (non-in-place: reuse padded buffer as scratch)
             // NOTE: MNNSiLu CANNOT be called in-place because MNNExp overwrites dst
@@ -427,6 +493,9 @@ void CPULinearAttention::gated_delta_rule_mnn(const std::vector<Tensor*>& inputs
             // because conv state was already saved above, totalLen >= L).
             ::memcpy(padded, out, L * sizeof(float));
             MNNSiLu(out, padded, L);
+            if (forceFp16) {
+                roundBufferToFp16(out, L);
+            }
         }
     }
     MNN_CONCURRENCY_END();
@@ -475,6 +544,11 @@ void CPULinearAttention::gated_delta_rule_mnn(const std::vector<Tensor*>& inputs
                 for (int i = 0; i < d_v; ++i) {
                     v_local[i] = convBase[(2 * key_dim + h * d_v + i) * L + t];
                 }
+                if (forceFp16) {
+                    roundBufferToFp16(q_local.data(), d_k);
+                    roundBufferToFp16(k_local.data(), d_k);
+                    roundBufferToFp16(v_local.data(), d_v);
+                }
 
                 // ── Step 3: Optional L2 Normalization on q_t and k_t ──
                 if (useL2Norm) {
@@ -488,26 +562,49 @@ void CPULinearAttention::gated_delta_rule_mnn(const std::vector<Tensor*>& inputs
                     for (int i = 0; i < d_k; ++i) sumSq += k_local[i] * k_local[i];
                     invNorm = 1.0f / sqrtf(sumSq + eps);
                     for (int i = 0; i < d_k; ++i) k_local[i] *= invNorm;
+                    if (forceFp16) {
+                        roundBufferToFp16(q_local.data(), d_k);
+                        roundBufferToFp16(k_local.data(), d_k);
+                    }
                 }
 
                 // ── Step 4: Scale q_t by 1/sqrt(d_k) ──
                 for (int i = 0; i < d_k; ++i) q_local[i] *= qScale;
+                if (forceFp16) {
+                    roundBufferToFp16(q_local.data(), d_k);
+                }
 
                 // ── Step 5: Gated Delta Rule recurrence ──
                 float g_t    = gatePtr[b * L * H + t * H + h];
                 float beta_t = betaPtr[b * L * H + t * H + h];
+                if (forceFp16) {
+                    g_t = roundToFp16(g_t);
+                    beta_t = roundToFp16(beta_t);
+                }
 
                 // 5.1 Decay: S = S * exp(g_t)
                 float decay = expf(g_t);
+                if (forceFp16) {
+                    decay = roundToFp16(decay);
+                }
                 MNNScaleAndAddBiasScalar(state, state, 0.0f, decay, d_k * d_v);
+                if (forceFp16) {
+                    roundBufferToFp16(state, d_k * d_v);
+                }
 
                 // 5.2 Read: v_pred = S^T @ k_t
                 gcore->MNNComputeMatMulForE_1(k_local.data(), state, localVPred.data(),
                                                nullptr, &matParam, 0);
+                if (forceFp16) {
+                    roundBufferToFp16(localVPred.data(), d_v);
+                }
 
                 // 5.3 Delta: delta = beta_t * (v_t - v_pred)
                 for (int i = 0; i < d_v; ++i) {
                     localDelta[i] = beta_t * (v_local[i] - localVPred[i]);
+                }
+                if (forceFp16) {
+                    roundBufferToFp16(localDelta.data(), d_v);
                 }
 
                 // 5.4 Write: S += k_t @ delta^T (outer product)
@@ -517,11 +614,17 @@ void CPULinearAttention::gated_delta_rule_mnn(const std::vector<Tensor*>& inputs
                         state[di * d_v + dj] += k_val * localDelta[dj];
                     }
                 }
+                if (forceFp16) {
+                    roundBufferToFp16(state, d_k * d_v);
+                }
 
                 // 5.5 Query: o_t = S^T @ q_t
                 float* o_t = outPtr + (b * L + t) * H * d_v + h * d_v;
                 gcore->MNNComputeMatMulForE_1(q_local.data(), state, o_t,
                                                nullptr, &matParam, 0);
+                if (forceFp16) {
+                    roundBufferToFp16(o_t, d_v);
+                }
             } // end timestep
         } // end head
     }
@@ -627,6 +730,7 @@ bool CPULinearAttention::onClone(Backend* bn, const Op* op, Execution** dst) {
 }
 
 CPULinearAttention::CPULinearAttention(Backend *backend, const MNN::Op* op) : Execution(backend) {
+    mDebugInstanceId = gLinearAttentionDebugId.fetch_add(1);
     auto param = op->main_as_LinearAttentionParam();
     mAttentionType = param->attn_type()->str();
     mNumKHeads = param->num_k_heads();

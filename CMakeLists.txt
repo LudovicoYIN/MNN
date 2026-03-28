@@ -501,6 +501,7 @@ ENDIF()
 
 # Utils
 FILE(GLOB MNN_Utils_SRC ${CMAKE_CURRENT_LIST_DIR}/source/utils/*)
+list(APPEND MNN_Utils_SRC ${CMAKE_CURRENT_LIST_DIR}/3rd_party/flatbuffers/src/util.cpp)
 add_library(MNNUtils OBJECT ${MNN_Utils_SRC})
 list(APPEND MNN_OBJECTS_TO_LINK $<TARGET_OBJECTS:MNNUtils>)
 list(APPEND MNN_TARGETS MNNUtils)

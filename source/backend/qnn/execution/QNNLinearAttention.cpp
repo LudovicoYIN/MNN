@@ -57,6 +57,8 @@ ErrorCode QNNLinearAttention::onEncode(const std::vector<Tensor*>& inputs, const
     const float eps = 1e-6f;
     const float qScaleValue = 1.0f / std::sqrt((float)dk);
     Qnn_DataType_t dataType = mBackend->getNativeTensor(inputs[0])->v1.dataType;
+    const Qnn_DataType_t normDataType = QNN_DATATYPE_FLOAT_32;
+    const Qnn_DataType_t recurrentDataType = QNN_DATATYPE_FLOAT_32;
 
     auto addNode = [&](const std::string& suffix, const std::string& type, std::vector<Qnn_Tensor_t> nodeInputs,
                        std::vector<Qnn_Param_t> nodeParams, std::vector<Qnn_Tensor_t> nodeOutputs) {
@@ -65,6 +67,9 @@ ErrorCode QNNLinearAttention::onEncode(const std::vector<Tensor*>& inputs, const
     };
     auto makeStage = [&](const std::string& name, const std::vector<int>& dims) {
         return this->createStageTensor(name, dataType, dims);
+    };
+    auto makeTypedStage = [&](const std::string& name, const std::vector<int>& dims, Qnn_DataType_t stageType) {
+        return this->createStageTensor(name, stageType, dims);
     };
     auto makeScalarInt = [&](const std::string& name, int value) -> std::shared_ptr<QNNParamScalarWrapper> {
         return this->createParamScalar(name, value);
@@ -105,6 +110,9 @@ ErrorCode QNNLinearAttention::onEncode(const std::vector<Tensor*>& inputs, const
     auto addUnary = [&](const std::string& suffix, const char* type, const Qnn_Tensor_t& in, const Qnn_Tensor_t& out) {
         addNode(suffix, type, {in}, {}, {out});
     };
+    auto addCast = [&](const std::string& suffix, const Qnn_Tensor_t& in, const Qnn_Tensor_t& out) {
+        addNode(suffix, "Cast", {in}, {}, {out});
+    };
     auto addSlice = [&](const std::string& suffix, const Qnn_Tensor_t& in, const Qnn_Tensor_t& out, const std::vector<int>& begin,
                         const std::vector<int>& end) {
         std::vector<int> rangeData(begin.size() * 3);
@@ -121,21 +129,22 @@ ErrorCode QNNLinearAttention::onEncode(const std::vector<Tensor*>& inputs, const
     const float* srcWeight = inputs[3]->host<float>();
     for (int c = 0; c < D; ++c) {
         for (int k = 0; k < kernelSize; ++k) {
-            convWeightData[k + kernelSize * c] = srcWeight[c * kernelSize + k];
+            // QNN depthwise conv expects weights packed with channel as the innermost dimension.
+            convWeightData[c + D * k] = srcWeight[c * kernelSize + k];
         }
     }
     std::vector<float> zeroBias(D, 0.0f);
     auto convWeight = this->createStaticFloatTensor("conv_weight", dataType, {(uint32_t)1, (uint32_t)kernelSize, (uint32_t)1, (uint32_t)D}, convWeightData.data());
     auto convBias = this->createStaticFloatTensor("conv_bias", dataType, {(uint32_t)D}, zeroBias.data());
-    auto qScale = this->createStaticFloatTensor("q_scale", dataType, {1, 1, 1, 1}, &qScaleValue);
-    auto epsTensor = this->createStaticFloatTensor("eps", dataType, {1, 1, 1, 1}, &eps);
+    auto qScale = this->createStaticFloatTensor("q_scale", normDataType, {1, 1, 1, 1}, &qScaleValue);
+    auto epsTensor = this->createStaticFloatTensor("eps", normDataType, {1, 1, 1, 1}, &eps);
 
     std::shared_ptr<Tensor> convStateWrap(Tensor::createDevice<float>({B, D, convStateSize}));
     std::shared_ptr<Tensor> recurrentWrap(Tensor::createDevice<float>({B, Hv, dk, dv}));
-    Qnn_Tensor_t* convStateIn = mBackend->addExtraInput(convStateWrap.get());
-    Qnn_Tensor_t* recurrentIn = mBackend->addExtraInput(recurrentWrap.get());
-    Qnn_Tensor_t* convStateOut = mBackend->addExtraOutput(convStateWrap.get());
-    Qnn_Tensor_t* recurrentOut = mBackend->addExtraOutput(recurrentWrap.get());
+    Qnn_Tensor_t* convStateIn = mBackend->addExtraInput(convStateWrap.get(), dataType);
+    Qnn_Tensor_t* recurrentIn = mBackend->addExtraInput(recurrentWrap.get(), recurrentDataType);
+    Qnn_Tensor_t* convStateOut = mBackend->addExtraOutput(convStateWrap.get(), dataType);
+    Qnn_Tensor_t* recurrentOut = mBackend->addExtraOutput(recurrentWrap.get(), recurrentDataType);
 
     auto rawConcat = makeStage("RawConcat", std::vector<int>{B, D, totalLen});
     addConcat("RawConcat", {*(convStateIn), *(mBackend->getNativeTensor(inputs[0]))}, *(rawConcat->getNativeTensor()), 2);
@@ -219,16 +228,21 @@ ErrorCode QNNLinearAttention::onEncode(const std::vector<Tensor*>& inputs, const
     }
 
     auto normalizeVec = [&](const std::string& prefix, std::shared_ptr<QNNTensorWrapper> inputTensor) -> std::shared_ptr<QNNTensorWrapper> {
-        auto square = makeStage(prefix + "_square", std::vector<int>{B, L, Hv, dk});
-        addBinary(prefix + "_square", "ElementWiseMultiply", *(inputTensor->getNativeTensor()), *(inputTensor->getNativeTensor()), *(square->getNativeTensor()));
-        auto sum = makeStage(prefix + "_sum", std::vector<int>{B, L, Hv, 1});
+        std::shared_ptr<QNNTensorWrapper> normInput = inputTensor;
+        if (inputTensor->getNativeTensor()->v1.dataType != normDataType) {
+            normInput = makeTypedStage(prefix + "_cast_in", std::vector<int>{B, L, Hv, dk}, normDataType);
+            addCast(prefix + "_cast_in", *(inputTensor->getNativeTensor()), *(normInput->getNativeTensor()));
+        }
+        auto square = makeTypedStage(prefix + "_square", std::vector<int>{B, L, Hv, dk}, normDataType);
+        addBinary(prefix + "_square", "ElementWiseMultiply", *(normInput->getNativeTensor()), *(normInput->getNativeTensor()), *(square->getNativeTensor()));
+        auto sum = makeTypedStage(prefix + "_sum", std::vector<int>{B, L, Hv, 1}, normDataType);
         addReduceSum(prefix + "_sum", *(square->getNativeTensor()), *(sum->getNativeTensor()), 3, true);
-        auto plusEps = makeStage(prefix + "_plus_eps", std::vector<int>{B, L, Hv, 1});
+        auto plusEps = makeTypedStage(prefix + "_plus_eps", std::vector<int>{B, L, Hv, 1}, normDataType);
         addBinary(prefix + "_plus_eps", "ElementWiseAdd", *(sum->getNativeTensor()), *(epsTensor->getNativeTensor()), *(plusEps->getNativeTensor()));
-        auto sqrt = makeStage(prefix + "_sqrt", std::vector<int>{B, L, Hv, 1});
+        auto sqrt = makeTypedStage(prefix + "_sqrt", std::vector<int>{B, L, Hv, 1}, normDataType);
         addUnary(prefix + "_sqrt", "ElementWiseSquareRoot", *(plusEps->getNativeTensor()), *(sqrt->getNativeTensor()));
-        auto out = makeStage(prefix + "_norm", std::vector<int>{B, L, Hv, dk});
-        addBinary(prefix + "_norm", "ElementWiseDivide", *(inputTensor->getNativeTensor()), *(sqrt->getNativeTensor()), *(out->getNativeTensor()));
+        auto out = makeTypedStage(prefix + "_norm", std::vector<int>{B, L, Hv, dk}, normDataType);
+        addBinary(prefix + "_norm", "ElementWiseDivide", *(normInput->getNativeTensor()), *(sqrt->getNativeTensor()), *(out->getNativeTensor()));
         return out;
     };
 
@@ -236,23 +250,28 @@ ErrorCode QNNLinearAttention::onEncode(const std::vector<Tensor*>& inputs, const
         qExpanded = normalizeVec("QNorm", qExpanded);
         kExpanded = normalizeVec("KNorm", kExpanded);
     }
-    auto qScaled = makeStage("QScaled", std::vector<int>{B, L, Hv, dk});
-    addBinary("QScaled", "ElementWiseMultiply", *(qExpanded->getNativeTensor()), *(qScale->getNativeTensor()), *(qScaled->getNativeTensor()));
+    std::shared_ptr<QNNTensorWrapper> qScaledInput = qExpanded;
+    if (qScaledInput->getNativeTensor()->v1.dataType != normDataType) {
+        qScaledInput = makeTypedStage("QScaledInput", std::vector<int>{B, L, Hv, dk}, normDataType);
+        addCast("QScaledInput", *(qExpanded->getNativeTensor()), *(qScaledInput->getNativeTensor()));
+    }
+    auto qScaled = makeTypedStage("QScaled", std::vector<int>{B, L, Hv, dk}, normDataType);
+    addBinary("QScaled", "ElementWiseMultiply", *(qScaledInput->getNativeTensor()), *(qScale->getNativeTensor()), *(qScaled->getNativeTensor()));
 
     std::shared_ptr<QNNTensorWrapper> stateCur;
     if (L == 1) {
-        stateCur = makeStage("StateCur", std::vector<int>{B, Hv, dk, dv});
+        stateCur = makeTypedStage("StateCur", std::vector<int>{B, Hv, dk, dv}, recurrentDataType);
         addReshape("StateCur", *recurrentIn, *(stateCur->getNativeTensor()));
     } else {
-        stateCur = makeStage("StateCurZero", std::vector<int>{B, Hv, dk, dv});
-        auto zeroState = this->createStaticFloatTensor("zero_state", dataType, {(uint32_t)1}, zeroBias.data());
+        stateCur = makeTypedStage("StateCurZero", std::vector<int>{B, Hv, dk, dv}, recurrentDataType);
+        auto zeroState = this->createStaticFloatTensor("zero_state", recurrentDataType, {(uint32_t)1}, zeroBias.data());
         addBinary("StateCurZero", "ElementWiseMultiply", *recurrentIn, *(zeroState->getNativeTensor()), *(stateCur->getNativeTensor()));
     }
 
     std::vector<Qnn_Tensor_t> stepOutputs;
     for (int t = 0; t < L; ++t) {
-        auto qStep = makeStage("QStep" + std::to_string(t), std::vector<int>{B, 1, Hv, dk});
-        auto kStep = makeStage("KStep" + std::to_string(t), std::vector<int>{B, 1, Hv, dk});
+        auto qStep = makeTypedStage("QStep" + std::to_string(t), std::vector<int>{B, 1, Hv, dk}, recurrentDataType);
+        auto kStep = makeTypedStage("KStep" + std::to_string(t), std::vector<int>{B, 1, Hv, dk}, recurrentDataType);
         auto vStep = makeStage("VStep" + std::to_string(t), std::vector<int>{B, 1, Hv, dv});
         auto gStep = makeStage("GStep" + std::to_string(t), std::vector<int>{B, 1, Hv});
         auto betaStep = makeStage("BetaStep" + std::to_string(t), std::vector<int>{B, 1, Hv});
@@ -262,46 +281,55 @@ ErrorCode QNNLinearAttention::onEncode(const std::vector<Tensor*>& inputs, const
         addGather("GatherG" + std::to_string(t), *(mBackend->getNativeTensor(inputs[1])), *(gStep->getNativeTensor()), 1, t);
         addGather("GatherBeta" + std::to_string(t), *(mBackend->getNativeTensor(inputs[2])), *(betaStep->getNativeTensor()), 1, t);
 
-        auto gState = makeStage("GState" + std::to_string(t), std::vector<int>{B, Hv, 1, 1});
-        auto betaVec = makeStage("BetaVec" + std::to_string(t), std::vector<int>{B, Hv, 1});
-        auto qVec = makeStage("QVec" + std::to_string(t), std::vector<int>{B, Hv, dk, 1});
-        auto kVec = makeStage("KVec" + std::to_string(t), std::vector<int>{B, Hv, dk, 1});
-        auto vVec = makeStage("VVec" + std::to_string(t), std::vector<int>{B, Hv, dv});
-        addReshape("GState" + std::to_string(t), *(gStep->getNativeTensor()), *(gState->getNativeTensor()));
-        addReshape("BetaVec" + std::to_string(t), *(betaStep->getNativeTensor()), *(betaVec->getNativeTensor()));
+        auto vStepFp32 = makeTypedStage("VStepFp32" + std::to_string(t), std::vector<int>{B, 1, Hv, dv}, recurrentDataType);
+        auto gStepFp32 = makeTypedStage("GStepFp32" + std::to_string(t), std::vector<int>{B, 1, Hv}, recurrentDataType);
+        auto betaStepFp32 = makeTypedStage("BetaStepFp32" + std::to_string(t), std::vector<int>{B, 1, Hv}, recurrentDataType);
+        addCast("VStepFp32" + std::to_string(t), *(vStep->getNativeTensor()), *(vStepFp32->getNativeTensor()));
+        addCast("GStepFp32" + std::to_string(t), *(gStep->getNativeTensor()), *(gStepFp32->getNativeTensor()));
+        addCast("BetaStepFp32" + std::to_string(t), *(betaStep->getNativeTensor()), *(betaStepFp32->getNativeTensor()));
+
+        auto gState = makeTypedStage("GState" + std::to_string(t), std::vector<int>{B, Hv, 1, 1}, recurrentDataType);
+        auto betaVec = makeTypedStage("BetaVec" + std::to_string(t), std::vector<int>{B, Hv, 1}, recurrentDataType);
+        auto qVec = makeTypedStage("QVec" + std::to_string(t), std::vector<int>{B, Hv, dk, 1}, recurrentDataType);
+        auto kVec = makeTypedStage("KVec" + std::to_string(t), std::vector<int>{B, Hv, dk, 1}, recurrentDataType);
+        auto vVec = makeTypedStage("VVec" + std::to_string(t), std::vector<int>{B, Hv, dv}, recurrentDataType);
+        addReshape("GState" + std::to_string(t), *(gStepFp32->getNativeTensor()), *(gState->getNativeTensor()));
+        addReshape("BetaVec" + std::to_string(t), *(betaStepFp32->getNativeTensor()), *(betaVec->getNativeTensor()));
         addReshape("QVec" + std::to_string(t), *(qStep->getNativeTensor()), *(qVec->getNativeTensor()));
         addReshape("KVec" + std::to_string(t), *(kStep->getNativeTensor()), *(kVec->getNativeTensor()));
-        addReshape("VVec" + std::to_string(t), *(vStep->getNativeTensor()), *(vVec->getNativeTensor()));
+        addReshape("VVec" + std::to_string(t), *(vStepFp32->getNativeTensor()), *(vVec->getNativeTensor()));
 
-        auto decay = makeStage("Decay" + std::to_string(t), std::vector<int>{B, Hv, 1, 1});
+        auto decay = makeTypedStage("Decay" + std::to_string(t), std::vector<int>{B, Hv, 1, 1}, recurrentDataType);
         addUnary("Decay" + std::to_string(t), "ElementWiseExp", *(gState->getNativeTensor()), *(decay->getNativeTensor()));
-        auto stateDecay = makeStage("StateDecay" + std::to_string(t), std::vector<int>{B, Hv, dk, dv});
+        auto stateDecay = makeTypedStage("StateDecay" + std::to_string(t), std::vector<int>{B, Hv, dk, dv}, recurrentDataType);
         addBinary("StateDecay" + std::to_string(t), "ElementWiseMultiply", *(stateCur->getNativeTensor()), *(decay->getNativeTensor()), *(stateDecay->getNativeTensor()));
 
-        auto weightedState = makeStage("WeightedState" + std::to_string(t), std::vector<int>{B, Hv, dk, dv});
+        auto weightedState = makeTypedStage("WeightedState" + std::to_string(t), std::vector<int>{B, Hv, dk, dv}, recurrentDataType);
         addBinary("WeightedState" + std::to_string(t), "ElementWiseMultiply", *(stateDecay->getNativeTensor()), *(kVec->getNativeTensor()), *(weightedState->getNativeTensor()));
-        auto vPred = makeStage("VPred" + std::to_string(t), std::vector<int>{B, Hv, dv});
+        auto vPred = makeTypedStage("VPred" + std::to_string(t), std::vector<int>{B, Hv, dv}, recurrentDataType);
         addReduceSum("VPred" + std::to_string(t), *(weightedState->getNativeTensor()), *(vPred->getNativeTensor()), 2, false);
 
-        auto diff = makeStage("Diff" + std::to_string(t), std::vector<int>{B, Hv, dv});
+        auto diff = makeTypedStage("Diff" + std::to_string(t), std::vector<int>{B, Hv, dv}, recurrentDataType);
         addBinary("Diff" + std::to_string(t), "ElementWiseSubtract", *(vVec->getNativeTensor()), *(vPred->getNativeTensor()), *(diff->getNativeTensor()));
-        auto delta = makeStage("Delta" + std::to_string(t), std::vector<int>{B, Hv, dv});
+        auto delta = makeTypedStage("Delta" + std::to_string(t), std::vector<int>{B, Hv, dv}, recurrentDataType);
         addBinary("Delta" + std::to_string(t), "ElementWiseMultiply", *(betaVec->getNativeTensor()), *(diff->getNativeTensor()), *(delta->getNativeTensor()));
-        auto deltaOuter = makeStage("DeltaOuter" + std::to_string(t), std::vector<int>{B, Hv, 1, dv});
+        auto deltaOuter = makeTypedStage("DeltaOuter" + std::to_string(t), std::vector<int>{B, Hv, 1, dv}, recurrentDataType);
         addReshape("DeltaOuter" + std::to_string(t), *(delta->getNativeTensor()), *(deltaOuter->getNativeTensor()));
-        auto update = makeStage("Update" + std::to_string(t), std::vector<int>{B, Hv, dk, dv});
+        auto update = makeTypedStage("Update" + std::to_string(t), std::vector<int>{B, Hv, dk, dv}, recurrentDataType);
         addBinary("Update" + std::to_string(t), "ElementWiseMultiply", *(kVec->getNativeTensor()), *(deltaOuter->getNativeTensor()), *(update->getNativeTensor()));
 
-        auto stateNext = (t == L - 1) ? std::shared_ptr<QNNTensorWrapper>() : makeStage("StateNext" + std::to_string(t), std::vector<int>{B, Hv, dk, dv});
+        auto stateNext = (t == L - 1) ? std::shared_ptr<QNNTensorWrapper>() : makeTypedStage("StateNext" + std::to_string(t), std::vector<int>{B, Hv, dk, dv}, recurrentDataType);
         Qnn_Tensor_t* stateNextTensor = (t == L - 1) ? recurrentOut : stateNext->getNativeTensor();
         addBinary("StateNext" + std::to_string(t), "ElementWiseAdd", *(stateDecay->getNativeTensor()), *(update->getNativeTensor()), *stateNextTensor);
 
-        auto weightedQuery = makeStage("WeightedQuery" + std::to_string(t), std::vector<int>{B, Hv, dk, dv});
+        auto weightedQuery = makeTypedStage("WeightedQuery" + std::to_string(t), std::vector<int>{B, Hv, dk, dv}, recurrentDataType);
         addBinary("WeightedQuery" + std::to_string(t), "ElementWiseMultiply", *stateNextTensor, *(qVec->getNativeTensor()), *(weightedQuery->getNativeTensor()));
-        auto outputVec = makeStage("OutputVec" + std::to_string(t), std::vector<int>{B, Hv, dv});
+        auto outputVec = makeTypedStage("OutputVec" + std::to_string(t), std::vector<int>{B, Hv, dv}, recurrentDataType);
         addReduceSum("OutputVec" + std::to_string(t), *(weightedQuery->getNativeTensor()), *(outputVec->getNativeTensor()), 2, false);
-        auto outputStep = makeStage("OutputStep" + std::to_string(t), std::vector<int>{B, 1, Hv, dv});
-        addReshape("OutputStep" + std::to_string(t), *(outputVec->getNativeTensor()), *(outputStep->getNativeTensor()));
+        auto outputStepFp32 = makeTypedStage("OutputStepFp32" + std::to_string(t), std::vector<int>{B, 1, Hv, dv}, recurrentDataType);
+        addReshape("OutputStepFp32" + std::to_string(t), *(outputVec->getNativeTensor()), *(outputStepFp32->getNativeTensor()));
+        auto outputStep = makeTypedStage("OutputStep" + std::to_string(t), std::vector<int>{B, 1, Hv, dv}, dataType);
+        addCast("OutputStep" + std::to_string(t), *(outputStepFp32->getNativeTensor()), *(outputStep->getNativeTensor()));
         stepOutputs.push_back(*(outputStep->getNativeTensor()));
 
         if (t != L - 1) {

@@ -41,6 +41,7 @@ private:
     int mNumKHeads;
     int mNumVHeads;
     bool mUseQKL2Norm;
+    int mDebugInstanceId = -1;
     std::shared_ptr<StateCache> mStateCache;
 
     // Temporary buffers for MNN-optimized path (per-Execution, DYNAMIC)

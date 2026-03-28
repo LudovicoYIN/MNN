@@ -45,6 +45,10 @@ add_executable(testModel.out ${CMAKE_CURRENT_LIST_DIR}/testModel.cpp)
 list(APPEND MNN_CPP_TOOLS testModel.out)
 
 add_executable(compilefornpu ${CMAKE_CURRENT_LIST_DIR}/compilefornpu.cpp ${CMAKE_CURRENT_LIST_DIR}/../../3rd_party/flatbuffers/src/util.cpp)
+set_target_properties(compilefornpu PROPERTIES
+    CXX_VISIBILITY_PRESET default
+    C_VISIBILITY_PRESET default
+    VISIBILITY_INLINES_HIDDEN OFF)
 list(APPEND MNN_CPP_TOOLS compilefornpu)
 
 if (MNN_QNN)
@@ -58,6 +62,21 @@ if (MNN_QNN)
     target_include_directories(checkQNNBinary PRIVATE ${CMAKE_SOURCE_DIR}/source/backend/qnn/backend/)
     target_link_libraries(checkQNNBinary dl)
     list(APPEND MNN_CPP_TOOLS checkQNNBinary)
+endif()
+
+if (MNN_QNN)
+    add_executable(qnn_context_probe ${CMAKE_CURRENT_LIST_DIR}/qnn_context_probe.cpp)
+    set(_QNN_ROOT "$ENV{QNN_SDK_ROOT}")
+    if (DEFINED QNN_SDK_ROOT AND NOT "${QNN_SDK_ROOT}" STREQUAL "")
+        set(_QNN_ROOT "${QNN_SDK_ROOT}")
+    endif()
+    target_include_directories(qnn_context_probe PRIVATE ${_QNN_ROOT}/include/)
+    target_include_directories(qnn_context_probe PRIVATE ${_QNN_ROOT}/include/QNN/)
+    target_link_libraries(qnn_context_probe dl)
+    if (ANDROID)
+        target_link_libraries(qnn_context_probe log)
+    endif()
+    list(APPEND MNN_CPP_TOOLS qnn_context_probe)
 endif()
 
 
