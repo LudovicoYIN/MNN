@@ -13,12 +13,12 @@
 #include <unordered_set>
 
 #include <MNN/AutoTime.hpp>
+#include "core/TensorUtils.hpp"
 #include "cpp/ExprDebug.hpp"
 #include "llm/llm.hpp"
 #include "kvmeta.hpp"
 #include "llmconfig.hpp"
-#include "prompt.hpp"
-#include "tokenizer.hpp"
+#include "tokenizer/tokenizer.hpp"
 #include "diskembedding.hpp"
 #include "sampler.hpp"
 #include "omni.hpp"
@@ -86,30 +86,34 @@ std::string Llm::dump_config() {
     return mConfig->config_.dump();
 }
 
-bool Llm::set_config(const std::string& content) {
-    auto res = mConfig->config_.merge(content.c_str());
-    // update prompt
-    if(mPrompt != nullptr) {
-        mPrompt->setParams(mConfig);
-    } else {
-        mPrompt.reset(Prompt::createPrompt(mContext, mConfig));
+void Llm::setChatTemplate() {
+    if (!mTokenizer || !mConfig->config_.contains("jinja")) return;
+    auto jinja = mConfig->config_["jinja"];
+    if (jinja.contains("chat_template")) {
+        std::string context;
+        if (jinja.contains("context")) {
+            context = jinja["context"].dump();
+        }
+        mTokenizer->set_chat_template(jinja["chat_template"].get<std::string>(), jinja.value("eos", ""), context);
     }
-    mAsync = mConfig->config_.document.HasMember("async") ? mConfig->config_.document["async"].GetBool() : true;
+}
+
+bool Llm::set_config(const std::string& content) {
+    mConfig->config_.merge(ujson::json::parse(content));
+    setChatTemplate();
+    mAsync = mConfig->config_.value("async", true);
     mGenerateParam->timeout_ms = mConfig->timeout_ms();
     mValidBlockSize.clear();
-    mBlockSize = 0;
-    if (mConfig->config_.document.HasMember("chunk")) {
-        mBlockSize = mConfig->config_.document["chunk"].GetInt();
-    }
-    if (mConfig->config_.document.HasMember("chunk_limits")) {
-        auto& size_limit = mConfig->config_.document["chunk_limits"];
+    mBlockSize = mConfig->config_.value("chunk", 0);
+    if (mConfig->config_.contains("chunk_limits")) {
+        auto size_limit = mConfig->config_["chunk_limits"];
         do {
-            if (!size_limit.IsArray()) {
+            if (!size_limit.is_array()) {
                 MNN_ERROR("size_limit must be array, eg: [128, 1]\n");
                 break;
             }
-            for (auto iter = size_limit.GetArray().begin(); iter != size_limit.GetArray().end(); iter++) {
-                mValidBlockSize.emplace_back(iter->GetInt());
+            for (size_t i = 0; i < size_limit.size(); i++) {
+                mValidBlockSize.emplace_back(size_limit[i].get<int>());
             }
             if (mValidBlockSize.size() < 2) {
                 MNN_ERROR("size_limit must be array larger than 1, eg: [128, 1]\n");
@@ -120,7 +124,11 @@ bool Llm::set_config(const std::string& content) {
             mBlockSize = mValidBlockSize[mValidBlockSize.size()-1];
         } while (false);
     }
-    return res;
+    return true;
+}
+
+void Llm::setDebugCallback(MNN::TensorCallBackWithInfo&& before, MNN::TensorCallBackWithInfo&& after) {
+    mExecutor->setCallBack(std::move(before), std::move(after));
 }
 
 void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg) {
@@ -276,20 +284,19 @@ bool Llm::load() {
             contextStream << contextFile.rdbuf();
             auto contextStr = contextStream.str();
             // check valid json
-            rapidjson::Document contextDoc;
-            contextDoc.Parse(contextStr.c_str());
-            if (!contextDoc.HasParseError()) {
+            auto contextJson = ujson::json::parse(contextStr);
+            if (!contextJson.is_null()) {
                 std::string config_json = R"({
                     "jinja": {
                         "context": )" + contextStr + R"(
                     }
                 })";
-                mConfig->config_.merge(config_json.c_str());
+                mConfig->config_.merge(ujson::json::parse(config_json));
             }
         }
     }
     mDiskEmbedding.reset(new DiskEmbedding(mConfig));
-    mPrompt.reset(Prompt::createPrompt(mContext, mConfig));
+    setChatTemplate();
     mSampler.reset(Sampler::createSampler(mContext, mConfig));
     // 3. load model
     Module::Config module_config;
@@ -309,10 +316,7 @@ bool Llm::load() {
     if (mConfig->has_talker()) {
         outputNames.emplace_back("talker_embeds");
     }
-    bool needHiddenState = false;
-    if (mConfig->config_.document.HasMember("hidden_states")) {
-        needHiddenState = mConfig->config_.document["hidden_states"].GetBool();
-    }
+    bool needHiddenState = mConfig->config_.value("hidden_states", false);
     if(mConfig->speculative_type() == "mtp") {
         needHiddenState = true;
     }
@@ -851,7 +855,9 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
             if(hidden_states == nullptr) {
                 return {};
             }
-            return generate(hidden_states, max_tokens);
+            auto result = generate(hidden_states, max_tokens);
+            completePrefixWrite();
+            return result;
         }
         int total_size = (int)input_ids.size();
         int loop_size = UP_DIV(total_size, mBlockSize);
@@ -868,6 +874,7 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
             }
             generate(input_embeds, 0);
         }
+        completePrefixWrite();
     } else {
         // update states
         updateContext((int)input_ids.size(), 0);
@@ -879,11 +886,11 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
 }
 
 std::string Llm::apply_chat_template(const std::string& user_content) const {
-    return mPrompt->applyTemplate(user_content, true);
+    return mTokenizer->apply_chat_template(user_content, mConfig->system_prompt());
 }
 
 std::string Llm::apply_chat_template(const ChatMessages& chat_prompts) const {
-    return mPrompt->applyTemplate(chat_prompts, true);
+    return mTokenizer->apply_chat_template(chat_prompts, true);
 }
 
 std::vector<int> Llm::tokenizer_encode(const std::string& user_content) {
@@ -900,7 +907,7 @@ void Llm::response(const MultimodalPrompt& multimodal_input,
     MNN::Express::ExecutorScope s(mExecutor);
     auto multimodal_input_copy = multimodal_input;
     if (mConfig->use_template()) {
-        multimodal_input_copy.prompt_template = mPrompt->applyTemplate(multimodal_input_copy.prompt_template, true);
+        multimodal_input_copy.prompt_template = apply_chat_template(multimodal_input_copy.prompt_template);
     }
     std::vector<int> input_ids = tokenizer_encode(multimodal_input_copy);
     response(input_ids, os, end_with, max_new_tokens);
@@ -922,7 +929,6 @@ std::vector<int> Llm::generate(MNN::Express::VARP input_embeds, int max_tokens) 
         mContext->status = LlmStatus::INTERNAL_ERROR;
         return {};
     }
-    
     updateContext(seqLen, 0);
     mContext->prefill_us += _t.durationInUs();
     MNN::Express::ExecutorScope::Current()->gc(); // after prefill
@@ -996,11 +1002,12 @@ void Llm::response(const std::string& user_content, std::ostream* os, const char
     MNN::Express::ExecutorScope s(mExecutor);
     auto prompt = user_content;
     if (mConfig->use_template()) {
-        prompt = mPrompt->applyTemplate(user_content, true);
+        prompt = apply_chat_template(user_content);
         if (prompt.empty()) {
             prompt = user_content;
         }
     }
+    std::cout << "prompt: " << prompt << std::endl;
     std::vector<int> input_ids = tokenizer_encode(prompt);
     response(input_ids, os, end_with, max_new_tokens);
 }
@@ -1011,7 +1018,7 @@ void Llm::response(const ChatMessages& chat_prompts, std::ostream* os, const cha
     if (chat_prompts.empty()) {
         return;
     }
-    auto prompt = mPrompt->applyTemplate(chat_prompts);
+    auto prompt = apply_chat_template(chat_prompts);
     std::vector<int> input_ids = tokenizer_encode(prompt);
     response(input_ids, os, end_with, max_new_tokens);
 }
@@ -1075,6 +1082,32 @@ bool Llm::setPrefixCacheFile(const std::string& filename, int flag) {
         }
     }
     return mIsPrefixFileExist;
+}
+
+void Llm::completePrefixWrite() {
+    if (!mPrefixCacheMode || mCallIndex != 1 || mIsPrefixFileExist) {
+        return;
+    }
+    mMeta->file_flag = KVMeta::NoChange;
+    mMeta->file_name = "";
+    mMeta->layer_index = 0;
+    // Create sync files to mark prefix cache as valid
+    auto prefixDir = mConfig->prefix_cache_path();
+    for (int i = 0; i < mConfig->layer_nums(); i++) {
+        auto base = MNNFilePathConcat(prefixDir, mPrefixCacheFileName) + "_" + std::to_string(i);
+        auto k_file = base + ".k";
+        if (MNNFileExist(k_file.c_str())) {
+            auto k_sync = base + "_sync.k";
+            auto fd = MNNCreateFile(k_sync.c_str());
+            if (fd != INVALID_FILE) { MNNCloseFile(fd); }
+        }
+        auto v_file = base + ".v";
+        if (MNNFileExist(v_file.c_str())) {
+            auto v_sync = base + "_sync.v";
+            auto fd = MNNCreateFile(v_sync.c_str());
+            if (fd != INVALID_FILE) { MNNCloseFile(fd); }
+        }
+    }
 }
 
 bool Llm::reuse_kv() { return mConfig->reuse_kv(); }

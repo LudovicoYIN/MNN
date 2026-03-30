@@ -238,14 +238,14 @@ ErrorCode Pipeline::encode(bool supportDebug, bool permitCodegen) {
     }
     // Propagate Scale and insert new command
     const RuntimeCreator* creator = nullptr;
-    {
+    if (mIsQuantModel) {
         auto type = mBackend->type();
         if (MNN_FORWARD_CPU_EXTENSION == type) {
             type = MNN_FORWARD_CPU;
         }
         creator = MNNGetExtraRuntimeCreator(type);
     }
-    if (mIsQuantModel && creator->onSetQuantInfo(nullptr, {}, {})) {
+    if (mIsQuantModel && creator && creator->onSetQuantInfo(nullptr, {}, {})) {
         // get propagate map
         using PropagateMap = std::map<const MNN::Tensor*, std::set<const MNN::Tensor*>>;
         PropagateMap forwardMap, backwardMap;
@@ -579,7 +579,7 @@ static ErrorCode _createExecutions(Schedule::PipelineInfo& mInfo, const std::str
             }
             // invalid means memory alloc failed
             if (!iter.execution->valid()) {
-                iter.execution = nullptr;
+                MNN_ERROR("Pipeline: execution invalid (OOM) for op type: %d\n", iter.op->type());
                 iter.execution = nullptr;
                 return OUT_OF_MEMORY;
             }
@@ -981,6 +981,7 @@ ErrorCode Pipeline::_allocForTensor(int index, bool allocInput) {
                 for (auto t : iter.workInputs) {
                     auto allocRes = _allocTensor(t, curBackend, mOutputStatic, index);
                     if (!allocRes) {
+                        MNN_ERROR("Pipeline: _allocTensor failed for input of op type: %d\n", iter.op->type());
                         return OUT_OF_MEMORY;
                     }
                 }
@@ -989,6 +990,7 @@ ErrorCode Pipeline::_allocForTensor(int index, bool allocInput) {
                 for (auto t : iter.workOutputs) {
                     auto res = _allocTensor(t, curBackend, mOutputStatic, index);
                     if (!res) {
+                        MNN_ERROR("Pipeline: _allocTensor failed for output of op type: %d\n", iter.op->type());
                         return OUT_OF_MEMORY;
                     }
                 }
@@ -1159,7 +1161,7 @@ ErrorCode Pipeline::execute() {
                     deviceOfOutput = deviceOfOutput + " " + std::to_string(cmd.workOutputs[v]->deviceId()) + " ";
                 }
                 deviceOfOutput += "]";
-                MNN_PRINT("Group: %d, %s - %d, type=%s, inputs: %s, devices: %s - %s\n", info.group, info.op->name()->c_str(), cmdIndex, EnumNameOpType(cmd.op->type()), groupOfInput.c_str(), deviceOfInput.c_str(), deviceOfOutput.c_str());
+                MNN_PRINT("Group: %d, %s - %d, type=%s, inputs: %s, devices: %s - %s\n", cmd.group, info.op->name()->c_str(), cmdIndex, EnumNameOpType(cmd.op->type()), groupOfInput.c_str(), deviceOfInput.c_str(), deviceOfOutput.c_str());
             }
 #endif
             auto code = cmd.execution->onExecute(cmd.workInputs, cmd.workOutputs);
