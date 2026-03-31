@@ -30,6 +30,52 @@ ErrorCode QNNBinary::onEncode(const std::vector<Tensor *> &inputs, const std::ve
         return this->onEncodeBroadcast(inputs, outputs, fullIndex);
     }
 
+    if(mBinaryTypeName == "ElementWiseMod"){
+        Qnn_DataType_t dataType = mBackend->getNativeTensor(inputs[fullIndex])->v1.dataType;
+        std::vector<uint32_t> shape = getNHWCShape(outputs[0]);
+        this->createStageTensor("divide_out", dataType, shape, outputs[0]); // mTempTensorWrappers[0]
+        this->createStageTensor("multiply_out", dataType, shape, outputs[0]); // mTempTensorWrappers[1]
+        // c = a / b
+        {
+            CLEAR_BEFORE_ADDING_NODE;
+            
+            std::string name = mNodeName + "_Divide";
+            mNodeType = "ElementWiseDivide";
+            
+            mInputs.push_back(*(mBackend->getNativeTensor(inputs[0])));
+            mInputs.push_back(*(mBackend->getNativeTensor(inputs[1])));
+            mOutputs.push_back(*(mTempTensorWrappers[0]->getNativeTensor()));
+            
+            mBackend->addNodeToGraph(mOpConfigVersion, name.c_str(), mPackageName.c_str(), mNodeType.c_str(), mParams, mInputs, mOutputs);
+        }
+        // d = b * c
+        {
+            CLEAR_BEFORE_ADDING_NODE;
+            
+            std::string name = mNodeName + "_Multiply";
+            mNodeType = "ElementWiseMultiply";
+            
+            mInputs.push_back(*(mBackend->getNativeTensor(inputs[1])));
+            mInputs.push_back(*(mTempTensorWrappers[0]->getNativeTensor()));
+            mOutputs.push_back(*(mTempTensorWrappers[1]->getNativeTensor()));
+            
+            mBackend->addNodeToGraph(mOpConfigVersion, name.c_str(), mPackageName.c_str(), mNodeType.c_str(), mParams, mInputs, mOutputs);
+        }
+        // out = a - d
+        {
+            CLEAR_BEFORE_ADDING_NODE;
+            
+            std::string name = mNodeName + "_Subtract";
+            mNodeType = "ElementWiseSubtract";
+            
+            mInputs.push_back(*(mBackend->getNativeTensor(inputs[0])));
+            mInputs.push_back(*(mTempTensorWrappers[1]->getNativeTensor()));
+            mOutputs.push_back(*(mBackend->getNativeTensor(outputs[0])));
+            
+            mBackend->addNodeToGraph(mOpConfigVersion, name.c_str(), mPackageName.c_str(), mNodeType.c_str(), mParams, mInputs, mOutputs);
+        }
+        return NO_ERROR;
+    }
     mNodeType = mBinaryTypeName;
     this->addNodeCommon(inputs, outputs);
 
@@ -47,6 +93,10 @@ ErrorCode QNNBinary::onEncodeScalarOptimize(const std::vector<Tensor *> &inputs,
     this->createStageTensor("stage_1", dataType, shape, inputs[fullIndex]); // mTempTensorWrappers[1]
 
     this->createParamTensor("multiples", QNN_DATATYPE_UINT_32, {(uint32_t)shape.size()}, shape.data()); // mParamTensorWrappers[0]
+    if(mBinaryTypeName == "ElementWiseMod"){
+        this->createStageTensor("divide_out", dataType, shape); // mTempTensorWrappers[2]
+        this->createStageTensor("multiply_out", dataType, shape); // mTempTensorWrappers[3]
+    }
 
     // Reshape
     {
@@ -76,7 +126,47 @@ ErrorCode QNNBinary::onEncodeScalarOptimize(const std::vector<Tensor *> &inputs,
     }
 
     // Binary
-    {
+    if(mBinaryTypeName == "ElementWiseMod"){
+        // c = a / b
+        {
+            CLEAR_BEFORE_ADDING_NODE;
+            
+            std::string name = mNodeName + "_Divide";
+            mNodeType = "ElementWiseDivide";
+
+            mInputs.push_back(*(mBackend->getNativeTensor(inputs[fullIndex]))); // full input
+            mInputs.push_back(*(mTempTensorWrappers[1]->getNativeTensor())); // stage 1
+            mOutputs.push_back(*(mTempTensorWrappers[2]->getNativeTensor()));
+
+            mBackend->addNodeToGraph(mOpConfigVersion, name.c_str(), mPackageName.c_str(), mNodeType.c_str(), mParams, mInputs, mOutputs);
+        }
+        // d = b * c
+        {
+            CLEAR_BEFORE_ADDING_NODE;
+            
+            std::string name = mNodeName + "_Multiply";
+            mNodeType = "ElementWiseMultiply";
+            
+            mInputs.push_back(*(mTempTensorWrappers[1]->getNativeTensor())); // stage 1
+            mInputs.push_back(*(mTempTensorWrappers[2]->getNativeTensor()));
+            mOutputs.push_back(*(mTempTensorWrappers[3]->getNativeTensor()));
+            
+            mBackend->addNodeToGraph(mOpConfigVersion, name.c_str(), mPackageName.c_str(), mNodeType.c_str(), mParams, mInputs, mOutputs);
+        }
+        // out = a - d
+        {
+            CLEAR_BEFORE_ADDING_NODE;
+            
+            std::string name = mNodeName + "_Subtract";
+            mNodeType = "ElementWiseSubtract";
+            
+            mInputs.push_back(*(mBackend->getNativeTensor(inputs[fullIndex]))); // full input
+            mInputs.push_back(*(mTempTensorWrappers[3]->getNativeTensor()));
+            mOutputs.push_back(*(mBackend->getNativeTensor(outputs[0])));
+            
+            mBackend->addNodeToGraph(mOpConfigVersion, name.c_str(), mPackageName.c_str(), mNodeType.c_str(), mParams, mInputs, mOutputs);
+        }
+    }else{
         CLEAR_BEFORE_ADDING_NODE;
 
         mNodeType = mBinaryTypeName;
@@ -156,7 +246,7 @@ public:
             {BinaryOpOperation_POW, "ElementWisePower"},
             {BinaryOpOperation_REALDIV, "ElementWiseDivide"},
             {BinaryOpOperation_MINIMUM, "ElementWiseMinimum"},
-            {BinaryOpOperation_MAXIMUM, "ElementWiseMaximum"}
+            {BinaryOpOperation_MAXIMUM, "ElementWiseMaximum"},
             // {BinaryOpOperation_GREATER, ""},
             // {BinaryOpOperation_GREATER_EQUAL, ""},
             // {BinaryOpOperation_LESS, ""},
@@ -165,7 +255,7 @@ public:
             // {BinaryOpOperation_LESS_EQUAL, ""},
             // {BinaryOpOperation_FLOORMOD, ""},
             // {BinaryOpOperation_EQUAL, ""},
-            // {BinaryOpOperation_MOD, ""},
+            {BinaryOpOperation_MOD, "ElementWiseMod"},
             // {BinaryOpOperation_ATAN2, ""},
             // {BinaryOpOperation_LOGICALOR, ""},
             // {BinaryOpOperation_NOTEQUAL, ""},

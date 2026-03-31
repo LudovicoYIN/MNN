@@ -339,6 +339,10 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
     (
      "dumpPass",
      "Enable verbose output for each optimization pass, showing what changes each pass made (like LLVM's -debug-pass)"
+    )
+    (
+     "skipConvolution3DTurn2D",
+     "Skip Convolution3D turn Convolution2D"
      )
     ;
 
@@ -560,6 +564,9 @@ bool Cli::initializeMNNConvertArgs(modelConfig &modelPath, int argc, char **argv
     }
     if (result.count("dumpPass")) {
         modelPath.dumpPass = true;
+    }
+    if(result.count("skipConvolution3DTurn2D")){
+        modelPath.skipConvolution3DTurn2D = true;
     }
     return true;
 }

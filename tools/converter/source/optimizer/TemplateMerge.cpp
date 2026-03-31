@@ -132,6 +132,9 @@ bool TemplateMerge::onExecute(const std::vector<VARP>& outputs, PassPriority pri
         hasChange = false;
         for (const auto& pass_name : mPriorities.at(priority)) {
             auto& pass = mTemplates.at(pass_name);
+            if(mSkipTemplates.find(pass_name) != mSkipTemplates.end()){
+                continue;
+            }
             std::set<EXPRP> invalidVARP;
             auto execute = splitInBoundary(Variable::getExecuteOrder(outputs), boundary);
             int changeCount = 0;

@@ -112,6 +112,7 @@ adb shell "cd ${ANDROID_WORKING_DIR} && export LD_LIBRARY_PATH=.:${ANDROID_LD_LI
 
 #### Host，生成QNN离线构图产物
 调用`MNN2QNNModel`工具，针对Device的硬件架构，生成QNN离线产物（`model_${SOC_ID}_${HEXAGON_ARCH}.bin`）以及替代模型（`model_${SOC_ID}_${HEXAGON_ARCH}.mnn`），具体可参考[该工具的用法](../tools/convert.md#mnn2qnnmodel)。
+或者调用/transformers/llm/export/npu目录下的`generate_llm_qnn.py`脚本工具来生成QNN离线产物，具体可参考[该脚本的用法](../transformers/llm.md#构建-qnn-模型)。
 
 #### Host，交叉编译Device侧的MNN库及AI应用程序
 - 参考[“主库编译”](../compile/engine.md#主库编译)，配置Android系统的编译环境及CMake变量。

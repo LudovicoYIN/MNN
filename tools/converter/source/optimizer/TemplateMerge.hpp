@@ -9,7 +9,7 @@
 #include <MNN/expr/Optimizer.hpp>
 #include "Global.hpp"
 #include "config.hpp"
-
+#include <set>
 #define MNN_THROW_CHECK(success, log) \
 if(!(success)){ \
 MNN_ERROR("Check failed: %s ==> %s\n", #success, #log); \
@@ -40,6 +40,10 @@ public:
     bool onExecute(const std::vector<VARP>& outputs, PassPriority priority, std::map<std::string, VARP>& updateVars, const std::vector<VARP>& boundary = {});
 
     static TemplateMerge& getInstance(const std::string& pass);
+    
+    void insertSkipTemplate(std::string key){
+        mSkipTemplates.insert(key);
+    }
 
     void insertTemplate(std::string key, std::function<bool(EXPRP)> compare, std::function<bool(EXPRP)> transform,
                         PassPriority priority = PASS_PRIORITY_HIGH);
@@ -50,6 +54,7 @@ private:
     }
     std::vector<std::vector<std::string>> mPriorities;
     std::map<std::string, std::function<bool(EXPRP)>> mTemplates;
+    std::set<std::string> mSkipTemplates;
 };
 class TemplateMergeRegister {
 public:

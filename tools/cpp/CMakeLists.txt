@@ -47,7 +47,6 @@ list(APPEND MNN_CPP_TOOLS testModel.out)
 add_executable(compilefornpu ${CMAKE_CURRENT_LIST_DIR}/compilefornpu.cpp ${CMAKE_CURRENT_LIST_DIR}/../../3rd_party/flatbuffers/src/util.cpp)
 list(APPEND MNN_CPP_TOOLS compilefornpu)
 
-
 if (MNN_QNN)
     add_executable(MNN2QNNModel ${CMAKE_CURRENT_LIST_DIR}/MNN2QNNModel.cpp)
     list(APPEND MNN_CPP_TOOLS MNN2QNNModel)
@@ -73,6 +72,9 @@ list(APPEND MNN_CPP_TOOLS testTrain.out)
 
 add_executable(fuseTest ${CMAKE_CURRENT_LIST_DIR}/fuseTest.cpp)
 list(APPEND MNN_CPP_TOOLS fuseTest)
+
+add_executable(generateIO ${CMAKE_CURRENT_LIST_DIR}/generateIO.cpp)
+list(APPEND MNN_CPP_TOOLS generateIO)
 
 endif()
 

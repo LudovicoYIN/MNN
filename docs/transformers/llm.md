@@ -311,7 +311,7 @@ mkdir build_64
 ```
 高通设备部分视觉模型支持NPU功能，可增加`MNN_QNN`宏启用QNN功能。QNN运行分2种模式：
 - 在线编译QNN模型：运行其它后端统一的mnn模型，运行时进行编译构图，通过需要较长的构图启动时间，主要用于功能正确性验证。
-- 离线编译QNN模型：使用MNN2QNNModel转换工具将统一的mnn模型离线编译转换成含有Plugin算子的mnn模型以及QNN模型，运行时直接运行编译好的QNN模型，用于生产部署情况。此时需要开启`MNN_WITH_PLUGIN`宏。
+- 离线编译QNN模型：使用/transformers/llm/export/npu/generate_llm_qnn.py转换工具将统一的mnn模型离线编译转换成含有Plugin算子的mnn模型以及QNN模型，运行时直接运行编译好的QNN模型，用于生产部署情况。此时需要开启`MNN_WITH_PLUGIN`宏。
 ```
 cd project/android
 mkdir build_64
@@ -945,6 +945,14 @@ cd transformers/llm/export
 python3 npu/generate_llm_qnn.py --model model --soc_id=57 --dsp_arch=v75
 ```
 
+使用该脚本可以构建 visual 的 qnn 模型
+eg:
+
+```
+python3 npu/generate_llm_qnn.py --model model --soc_id=57 --dsp_arch=v75 --image_sizes 512x512,256x256 --model_name visual.mnn
+```
+--image_sizes可以指定多组输入大小，还需要指定--model_name为visual.mnn
+
 目标设备`soc_id` 和 `dsp_arch` 可在高通官方查询，如下为一些设备的参考
 
 | 硬件    | SOC ID | HEXAGON ARCH |
@@ -953,6 +961,54 @@ python3 npu/generate_llm_qnn.py --model model --soc_id=57 --dsp_arch=v75
 | 8 Gen 2 | 43     | 73           |
 | 8 Gen 3 | 57     | 75           |
 | 8 Elite | 69     | 79           |
+
+目前该脚本默认支持导出的llm相关模型不多。遇到一些不支持的模型，或者是导出普通的非llm相关模型，可以通过手动编写一个input.json文件来指定多组输入的尺寸，调用该脚本构建离线 qnn 模型
+eg:
+
+```
+python3 npu/generate_llm_qnn.py --model model --soc_id=57 --dsp_arch=v75 --model_name resnet18.mnn --input_json input.json 
+```
+input.json 的格式如下所示
+eg:
+```
+{
+    "configs": [
+        {
+            "inputs": [
+                {
+                    "name": "data",
+                    "shape": [
+                        1,
+                        3,
+                        224,
+                        224
+                    ]
+                }
+            ],
+            "outputs": [
+                "fc1000"
+            ]
+        },
+        {
+            "inputs": [
+                {
+                    "name": "data",
+                    "shape": [
+                        1,
+                        3,
+                        128,
+                        128
+                    ]
+                }
+            ],
+            "outputs": [
+                "fc1000"
+            ]
+        }
+    ]
+}
+```
+如果不清楚当前mnn模型具体有哪些输入输出，以及对应的名称，可以调用`tools/cpp/GetMNNInfo.cpp`工具获取，[工具](../tools/test.md#getmnninfo)
 
 
 ***执行成功后，会在 model 目录下产出 config_qnn.json 及 model/qnn 目录***

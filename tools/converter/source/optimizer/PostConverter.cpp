@@ -662,6 +662,11 @@ std::unique_ptr<MNN::NetT> optimizeNet(std::unique_ptr<MNN::NetT>& originNet, bo
     ctx.completed_subgraphs = {};
     ctx.RunOptimize = optimizeNetImpl;
 
+    if(config.skipConvolution3DTurn2D){
+        auto& merge = MNN::Express::TemplateMerge::getInstance("Merge");
+        merge.insertSkipTemplate("Convolution3DTurn2D");
+    }
+    
     Global<OptimizeContext>::Reset(&ctx);
     std::unordered_map<std::string, VARP> inputs, empty;
     // subgraph may depend on vars of outter subgraph or root net, getting vars of them need Program::create.

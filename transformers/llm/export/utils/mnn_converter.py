@@ -82,6 +82,8 @@ class MNNConverter:
             convert_args += ['--saveExternalData']
         if self.args.hqq:
             convert_args += ['--hqq']
+        if self.args.generate_for_npu:
+            convert_args += ['--skipConvolution3DTurn2D']
         convert_args += args
         self.convert(convert_args)
         return mnn_path

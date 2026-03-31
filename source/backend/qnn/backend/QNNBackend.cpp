@@ -9,6 +9,7 @@
 #include "QNNBackend.hpp"
 #include "core/MNNFileUtils.h"
 #include "QnnTypeMacros.hpp"
+#include "half.hpp"
 // #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
 #include "core/FileLoader.hpp"
@@ -1032,16 +1033,16 @@ private:
         if (stateNumber == 0) {
             return;
         }
-        mMask.reset(RPCBuffer::alloc(mStateMaxSize * sizeof(__fp16)));
-        auto maskPtr = (__fp16*)mMask->mPtr;
+        mMask.reset(RPCBuffer::alloc(mStateMaxSize * sizeof(half_float::half)));
+        auto maskPtr = (half_float::half*)mMask->mPtr;
         for (int i=0; i<mStateMaxSize; ++i) {
             maskPtr[i] = mMinValue;
         }
         for (int i=0; i<mStateInput.size(); ++i) {
-            mStateInput[i].data.reset(RPCBuffer::alloc(mStateMaxSize * mStateInput[i].inside * mStateInput[i].outside * sizeof(__fp16)));
+            mStateInput[i].data.reset(RPCBuffer::alloc(mStateMaxSize * mStateInput[i].inside * mStateInput[i].outside * sizeof(half_float::half)));
             mStateInput[i].update.resize(seqLen.size());
             for (int j=0; j<seqLen.size(); ++j) {
-                mStateInput[i].update[j].reset(RPCBuffer::alloc(mStateInput[i].inside * mStateInput[i].outside * seqLen[j] * sizeof(__fp16)));
+                mStateInput[i].update[j].reset(RPCBuffer::alloc(mStateInput[i].inside * mStateInput[i].outside * seqLen[j] * sizeof(half_float::half)));
             }
         }
     }
@@ -1223,7 +1224,7 @@ public:
         // If has remove, remove invalid state
         auto meta = (KVMeta*)(ctx->backend()->getMetaPtr());
         if (nullptr != meta && mStateInput.size() > 0) {
-            auto maskPtr = (__fp16*)mMask->mPtr;
+            auto maskPtr = (half_float::half*)mMask->mPtr;
             if (meta->remove > 0) {
                 if (meta->remove > mStateCurrent) {
                     MNN_ERROR("QNN: Error: Remove %d larger than current = %d\n", meta->remove, mStateCurrent);
@@ -1241,7 +1242,7 @@ public:
         }
         // Update State
         if (nullptr != meta && mStateInput.size() > 0) {
-            auto maskPtr = (__fp16*)mMask->mPtr;
+            auto maskPtr = (half_float::half*)mMask->mPtr;
             if (meta->add + mStateCurrent > mStateMaxSize) {
                 MNN_ERROR("QNN: Error: KV length %d larger than max size = %d\n", meta->add + mStateCurrent, mStateMaxSize);
                 return false;

@@ -49,7 +49,6 @@ public:
 
     Session* clone(RuntimeInfo&& runtime, std::shared_ptr<Schedule::ScheduleInfo> sharedConst);
     static void createPipelineBackend(Schedule::PipelineInfo& iter, RuntimeInfo& runtime);
-
 public:
     /**
      * @brief infer.

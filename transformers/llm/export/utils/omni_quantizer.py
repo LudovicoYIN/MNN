@@ -172,10 +172,31 @@ class OmniQuantizer:
                 sanitized_kwargs[k] = v
         return sanitized_kwargs
 
+    def _select_layer_kwargs(self, module, inputs_kwargs):
+        """Select the attention mask slice for mixed-attention stacks."""
+        selected_kwargs = dict(inputs_kwargs)
+        attention_mask = selected_kwargs.get("attention_mask", None)
+        if attention_mask is None:
+            return selected_kwargs
+
+        if getattr(self.model.config, "attention_type", None) != "mix":
+            return selected_kwargs
+
+        if isinstance(attention_mask, torch.Tensor) and attention_mask.dim() >= 1 and attention_mask.shape[0] == 2:
+            layer_type = getattr(module, "layer_type", None)
+            is_sliding = layer_type in ("linear_attention", "sliding_attention")
+            selected_kwargs["attention_mask"] = attention_mask[int(is_sliding)]
+        return selected_kwargs
+
     def _clear_block_kv_cache(self, block):
         """Clear KV cache on the block's attention so each calibration sample is independent."""
-        if hasattr(block, "self_attn") and hasattr(block.self_attn, "past_key_value"):
-            block.self_attn.past_key_value = None
+        if hasattr(block, "self_attn") and block.self_attn is not None:
+            if hasattr(block.self_attn, "past_key_value"):
+                block.self_attn.past_key_value = None
+            if hasattr(block.self_attn, "conv_state"):
+                block.self_attn.conv_state = None
+            if hasattr(block.self_attn, "rnn_state"):
+                block.self_attn.rnn_state = None
 
     def _safe_forward(self, x, module, module_kwargs):
         try:
@@ -514,7 +535,23 @@ class OmniQuantizer:
                     inp = i
                 mlp_inputs_list.append(inp.detach().view(-1, inp.shape[-1]))
 
-            h1 = block.self_attn.q_proj.register_forward_hook(hook_attn_input)
+            attn_module = block.self_attn
+            attn_linears = []
+            attn_hook_target = None
+            if all(hasattr(attn_module, name) for name in ("q_proj", "k_proj", "v_proj")):
+                attn_linears = [attn_module.q_proj, attn_module.k_proj, attn_module.v_proj]
+                attn_hook_target = attn_module.q_proj
+            elif hasattr(attn_module, "in_proj_qkv"):
+                attn_linears = [attn_module.in_proj_qkv]
+                for optional_name in ("in_proj_a", "in_proj_b", "in_proj_z"):
+                    optional_proj = getattr(attn_module, optional_name, None)
+                    if optional_proj is not None:
+                        attn_linears.append(optional_proj)
+                attn_hook_target = attn_module.in_proj_qkv
+
+            h1 = None
+            if attn_hook_target is not None:
+                h1 = attn_hook_target.register_forward_hook(hook_attn_input)
             h2 = block.mlp.gate_proj.register_forward_hook(hook_mlp_input)
 
             # Pre-compute sanitized kwargs once for this block
@@ -524,6 +561,7 @@ class OmniQuantizer:
                     sample_kw_gpu[k] = v.to(self.best_device)
                 else:
                     sample_kw_gpu[k] = v
+            sample_kw_gpu = self._select_layer_kwargs(block, sample_kw_gpu)
             sanitized_kw_template = self._sanitize_kwargs(sample_kw_gpu, block)
 
             # Single forward pass: collect hooks AND compute outputs
@@ -532,6 +570,7 @@ class OmniQuantizer:
                     # Clear KV cache so each sample is processed independently (no past_key_value from previous iteration)
                     self._clear_block_kv_cache(block)
                     inp_gpu = inp.to(self.best_device)
+                    kw = self._select_layer_kwargs(block, kw)
 
                     # Reuse sanitized keys, only update tensor values
                     kw_gpu = {}
@@ -548,7 +587,8 @@ class OmniQuantizer:
 
                     del inp_gpu, kw_gpu, out
 
-            h1.remove()
+            if h1 is not None:
+                h1.remove()
             h2.remove()
 
             # Process collected attention inputs
@@ -557,10 +597,9 @@ class OmniQuantizer:
                 total_attn_in = torch.cat(attn_inputs_list, dim=0).to("cpu")
                 del attn_inputs_list
 
-                qkv = [block.self_attn.q_proj, block.self_attn.k_proj, block.self_attn.v_proj]
                 ln_attn = block.input_layernorm
                 robust_max_attn = self._get_robust_act_max(total_attn_in)
-                self._run_optimization(total_attn_in, qkv, ln_attn, robust_max_attn)
+                self._run_optimization(total_attn_in, attn_linears, ln_attn, robust_max_attn)
                 del total_attn_in, robust_max_attn
 
             # Process collected MLP inputs
@@ -671,6 +710,7 @@ class OmniQuantizer:
                     # Process each calibration sample independently to avoid KV cache from the previous sample causing dimension mismatch between attn_weights and attention_mask
                     self._clear_block_kv_cache(block)
                     inp_gpu = inp.to(self.best_device)
+                    kw = self._select_layer_kwargs(block, kw)
                     kw_gpu = {k: (v.to(self.best_device) if isinstance(v, torch.Tensor) else v) for k, v in kw.items()}
 
                     # First forward: collect activation scales
@@ -756,6 +796,7 @@ class OmniQuantizer:
             pass_round += 1
             update_count = 0
 
+            # Forward: Data -> Output
             for op in mnn_ops:
                 op_type = op.get('type', '')
                 inputs = op.get('inputIndexes', [])
@@ -779,37 +820,22 @@ class OmniQuantizer:
                                 changed = True
                                 update_count += 1
 
-                    target_info = None
-                    for out_idx in outputs:
-                        if out_idx in quant_info_dict:
-                            target_info = quant_info_dict[out_idx]
-                            break
-
-                    if target_info:
-                        for inp_idx in inputs:
-                            if inp_idx not in quant_info_dict:
-                                quant_info_dict[inp_idx] = copy.deepcopy(target_info)
-                                quant_info_dict[inp_idx]['index'] = inp_idx
-                                changed = True
-                                update_count += 1
-
                 elif op_type in DATA_SELECT_OPS:
                     data_idx = inputs[0]
                     out_idx = outputs[0]
 
-                    # Forward: Data -> Output
                     if data_idx in quant_info_dict and out_idx not in quant_info_dict:
                         quant_info_dict[out_idx] = copy.deepcopy(quant_info_dict[data_idx])
                         quant_info_dict[out_idx]['index'] = out_idx
                         changed = True
                         update_count += 1
-
-                    # Backward: Output -> Data
-                    if out_idx in quant_info_dict and data_idx not in quant_info_dict:
-                        quant_info_dict[data_idx] = copy.deepcopy(quant_info_dict[out_idx])
-                        quant_info_dict[data_idx]['index'] = data_idx
-                        changed = True
-                        update_count += 1
+                    
+                    if out_idx in quant_info_dict and data_idx in quant_info_dict:
+                        if quant_info_dict[data_idx]['quantInfo']['scale'] != quant_info_dict[out_idx]['quantInfo']['scale'] or quant_info_dict[data_idx]['quantInfo']['zero'] != quant_info_dict[out_idx]['quantInfo']['zero']:
+                            quant_info_dict[out_idx]['quantInfo']['scale'] = quant_info_dict[data_idx]['quantInfo']['scale']
+                            quant_info_dict[out_idx]['quantInfo']['zero'] = quant_info_dict[data_idx]['quantInfo']['zero']
+                            changed = True
+                            update_count += 1
 
                 elif op_type == 'BinaryOp':
                     out_idx = outputs[0]
@@ -839,6 +865,59 @@ class OmniQuantizer:
                             quant_info_dict[out_idx]['index'] = out_idx
                             changed = True
                             update_count += 1
+
+            # Backward: Output -> Data
+            if changed == False:
+                for op in mnn_ops:
+                    op_type = op.get('type', '')
+                    inputs = op.get('inputIndexes', [])
+                    outputs = op.get('outputIndexes', [])
+
+                    if not inputs or not outputs:
+                        continue
+
+                    if op_type in PASS_THROUGH_OPS:
+                        target_info = None
+                        for out_idx in outputs:
+                            if out_idx in quant_info_dict:
+                                target_info = quant_info_dict[out_idx]
+                                break
+
+                        if target_info:
+                            for inp_idx in inputs:
+                                if inp_idx not in quant_info_dict:
+                                    quant_info_dict[inp_idx] = copy.deepcopy(target_info)
+                                    quant_info_dict[inp_idx]['index'] = inp_idx
+                                    changed = True
+                                    update_count += 1
+
+                    elif op_type == 'BinaryOp':
+                        out_idx = outputs[0]
+
+                        if out_idx in quant_info_dict:
+                            target_info = quant_info_dict[out_idx]
+                            for inp_idx in inputs:
+                                if inp_idx not in quant_info_dict:
+                                    quant_info_dict[inp_idx] = copy.deepcopy(target_info)
+                                    quant_info_dict[inp_idx]['index'] = inp_idx
+                                    changed = True
+                                    update_count += 1
+                        else:
+                            scales = []
+                            valid_inputs = []
+                            for inp_idx in inputs:
+                                if inp_idx in quant_info_dict:
+                                    scales.append(quant_info_dict[inp_idx]['quantInfo']['scale'])
+                                    valid_inputs.append(inp_idx)
+
+                            if len(valid_inputs) > 0:
+                                max_scale_idx = valid_inputs[scales.index(max(scales))]
+                                source = quant_info_dict[max_scale_idx]
+
+                                quant_info_dict[out_idx] = copy.deepcopy(source)
+                                quant_info_dict[out_idx]['index'] = out_idx
+                                changed = True
+                                update_count += 1
 
             print(f"  Pass {pass_round}: Updated {update_count} tensors.")
 

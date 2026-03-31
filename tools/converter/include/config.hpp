@@ -77,6 +77,7 @@ public:
     bool splitQuantBlock = false;
     // Enable verbose output for each optimization pass (like LLVM's -debug-pass)
     bool dumpPass = false;
+    bool skipConvolution3DTurn2D = false;
 };
 
 #endif // CONFIG_HPP

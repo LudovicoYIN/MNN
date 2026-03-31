@@ -112,6 +112,8 @@ extern void ___QNNAttentionCreator__OpType_Attention__();
 #endif
 extern void ___QNNQuantCreator__OpType_FloatToInt8__();
 extern void ___QNNDeQuantCreator__OpType_Int8ToFloat__();
+extern void ___QNNConvolution3DCreator__OpType_Convolution3D__();
+extern void ___QNNTopKV2Creator__OpType_TopKV2__();
 
 void registerQNNOps();
 

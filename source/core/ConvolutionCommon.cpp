@@ -904,6 +904,62 @@ std::tuple<int, int, int, int> ConvolutionCommon::convolutionPadFull(const Tenso
     return std::make_tuple(pad.first, pad.second, padRight, padBottom);
 }
 
+std::tuple<int, int, int, int, int, int> ConvolutionCommon::convolution3DPadFull(const Tensor* input, const Tensor* output,
+                                                         const Convolution3DCommon* common) {
+    auto inputShape = input->shape();
+    auto outputShape = output->shape();
+    int iw = inputShape[4];
+    int ih = inputShape[3];
+    int id = inputShape[2];
+    int ow = outputShape[4];
+    int oh = outputShape[3];
+    int od = outputShape[2];
+    int padX = 0, padY = 0, padZ = 0;
+    int srideX = common->strides()->data()[0];
+    int srideY = common->strides()->data()[1];
+    int srideZ = common->strides()->data()[2];
+    int dilateX = common->dilates()->data()[0];
+    int dilateY = common->dilates()->data()[1];
+    int dilateZ = common->dilates()->data()[2];
+    int kernelX = common->kernels()->data()[0];
+    int kernelY = common->kernels()->data()[1];
+    int kernelZ = common->kernels()->data()[2];
+    if (common->padMode() == PadMode_SAME) {
+        int kernelDepthSize = (kernelX - 1) * dilateX + 1;
+        int kernelHeightSize = (kernelY - 1) * dilateY + 1;
+        int kernelWidthSize  = (kernelZ - 1) * dilateZ + 1;
+        
+        int padNeededDepth = (od - 1) * srideX + kernelDepthSize - id;
+        int padNeededHeight = (oh - 1) * srideY + kernelHeightSize - ih;
+        int padNeededWidth  = (ow - 1) * srideZ + kernelWidthSize - iw;
+        padX = padNeededDepth / 2;
+        padY = padNeededHeight / 2;
+        padZ = padNeededWidth / 2;
+    }
+    if (nullptr != common->pads() && common->pads()->size() >= 3) {
+        padX = common->pads()->data()[0];
+        padY = common->pads()->data()[1];
+        padZ = common->pads()->data()[2];
+    }
+
+    int leftX = (od - 1) * srideX + (kernelX - 1) * dilateX - padX;
+    int padXleft = 0;
+    if (leftX >= id) {
+        padXleft = leftX - id + 1;
+    }
+    int letfY = (oh - 1) * srideY + (kernelY- 1) * dilateY - padY;
+    int padYleft = 0;
+    if (letfY >= ih) {
+        padYleft = letfY - ih + 1;
+    }
+    int letfZ = (ow - 1) * srideZ + (kernelZ- 1) * dilateZ - padZ;
+    int padZleft = 0;
+    if (letfZ >= iw) {
+        padZleft = letfZ - iw + 1;
+    }
+    return std::make_tuple(padX, padXleft, padY, padYleft, padZ, padZleft);
+}
+
 std::pair<int, int> ConvolutionCommon::convolutionTransposePad(const Tensor *input, const Tensor *output,
                                                                const Convolution2DCommon *mCommon) {
     if (mCommon->padMode() == PadMode_SAME) {
