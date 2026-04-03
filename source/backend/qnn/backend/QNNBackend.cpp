@@ -24,6 +24,42 @@
 namespace MNN {
 static std::string gExtraIoPrefix = "_mnn";
 namespace QNN {
+
+static std::vector<float> _tensorToFloatBuffer(const Tensor* tensor) {
+    const auto type = tensor->getType();
+    const auto size = tensor->elementSize();
+    auto hostPtr = tensor->buffer().host;
+    MNN_PRINT("MNN_QNN_DEBUG: static tensor host=%p code=%d bits=%d dims=%d size=%d\n",
+              hostPtr, type.code, type.bits, tensor->dimensions(), size);
+    if (hostPtr == nullptr) {
+        MNN_ERROR("MNN_QNN: tensor host buffer is null when creating static tensor.\n");
+        MNN_ASSERT(false);
+    }
+    std::vector<float> result(size);
+    if (type.code == halide_type_float && type.bits == 32) {
+        ::memcpy(result.data(), tensor->host<float>(), size * sizeof(float));
+        return result;
+    }
+    if (type.code == halide_type_float && type.bits == 16) {
+        auto src = reinterpret_cast<const half_float::half*>(tensor->buffer().host);
+        for (int i = 0; i < size; ++i) {
+            result[i] = (float)src[i];
+        }
+        return result;
+    }
+    if (type.code == halide_type_bfloat && type.bits == 16) {
+        auto src = tensor->host<int16_t>();
+        for (int i = 0; i < size; ++i) {
+            uint32_t value = ((uint16_t)src[i]) << 16;
+            ::memcpy(result.data() + i, &value, sizeof(float));
+        }
+        return result;
+    }
+    MNN_ERROR("MNN_QNN: unsupported float tensor type code=%d bits=%d when creating static tensor.\n", type.code, type.bits);
+    MNN_ASSERT(false);
+    return result;
+}
+
 struct QnnContext {
     QNN_INTERFACE_VER_TYPE interface{};
     QNN_SYSTEM_INTERFACE_VER_TYPE systemInterface{};
@@ -1425,19 +1461,26 @@ Backend::MemObj* QnnBackend::onAcquire(const Tensor* tensor, StorageType storage
     tScaleOffsetEncoding.offset = 0;
     auto quant = TensorUtils::getDescribe(tensor)->quantAttr.get();
     bool isQuant = quant != nullptr && TensorUtils::getDescribe(tensor)->applyQuant;
+    if (tensor->getType().code == halide_type_int && tensor->getType().bits == 32) {
+        isQuant = false;
+    }
     //MNN_ASSERT((tensor->getType().code == halide_type_float) || (tensor->getType().code == halide_type_int && tensor->getType().bits == 32));
-    if (mUseFP16 && tensor->getType().code == halide_type_float) {
+    if (mUseFP16 && (tensor->getType().code == halide_type_float || tensor->getType().code == halide_type_bfloat)) {
         tType = QNN_TENSOR_TYPE_NATIVE;
         tDataType = QNN_DATATYPE_FLOAT_16;
-    } else if (tensor->getType().code == halide_type_float) {
+    } else if (tensor->getType().code == halide_type_float || tensor->getType().code == halide_type_bfloat) {
         tDataType = QNN_DATATYPE_FLOAT_32;
     } else if (tensor->getType().code == halide_type_int && tensor->getType().bits == 32) {
         tDataType = QNN_DATATYPE_INT_32;
     } else {
         MNN_PRINT("MNN_QNN: Not supported data type in <QnnBackend::onAcquire>.\n");
+        MNN_PRINT("MNN_QNN: code=%d bits=%d usage=%d index=%d dims=%d\n",
+                  tensor->getType().code, tensor->getType().bits,
+                  (int)TensorUtils::getDescribe(tensor)->usage,
+                  TensorUtils::getDescribe(tensor)->index, tensor->dimensions());
         return nullptr;
     }
-    if(isQuant) {
+    if(isQuant && (tensor->getType().code == halide_type_float || tensor->getType().code == halide_type_bfloat)) {
         tType = QNN_TENSOR_TYPE_NATIVE;
         auto quantType = TensorUtils::getDescribe(tensor)->quantAttr->type;
         if(quantType == DataType_DT_INT8){
@@ -1480,13 +1523,13 @@ Backend::MemObj* QnnBackend::onAcquire(const Tensor* tensor, StorageType storage
     }
 
     std::string suffix = "";
-    if(isInput && mUseFP16 && tensor->getType().code == halide_type_float){
+    if(isInput && mUseFP16 && (tensor->getType().code == halide_type_float || tensor->getType().code == halide_type_bfloat)){
         suffix = "_cast";
     }
-    if(isOutput && isQuant){
+    if(isOutput && isQuant && (tensor->getType().code == halide_type_float || tensor->getType().code == halide_type_bfloat)){
         suffix = "_dequant";
     }
-    if(isOutput && mUseFP16 && tensor->getType().code == halide_type_float){
+    if(isOutput && mUseFP16 && (tensor->getType().code == halide_type_float || tensor->getType().code == halide_type_bfloat)){
         suffix = "_cast";
     }
     std::shared_ptr<QNNTensorWrapper> qnnTensorWrapper = QNNTensorWrapper::create(tName + suffix, tType, tDataType, tDims, tQuantizeParams);
@@ -1498,7 +1541,7 @@ Backend::MemObj* QnnBackend::onAcquire(const Tensor* tensor, StorageType storage
 
     if (isInput) {
         // create stage tensor to cast
-        if (mUseFP16 && tensor->getType().code == halide_type_float) {
+        if (mUseFP16 && (tensor->getType().code == halide_type_float || tensor->getType().code == halide_type_bfloat)) {
             mTensorCounter += 1;
             std::shared_ptr<Tensor> stageTensor;
             stageTensor.reset(Tensor::create<float>(tensor->shape(), nullptr, tensorDimType));
@@ -1517,14 +1560,18 @@ Backend::MemObj* QnnBackend::onAcquire(const Tensor* tensor, StorageType storage
         }
     }
     if (isOutput) {
-        if(isQuant){
+        if(isQuant && (tensor->getType().code == halide_type_float || tensor->getType().code == halide_type_bfloat)){
             mTensorCounter += 1;
             std::shared_ptr<Tensor> stageTensor;
             stageTensor.reset(Tensor::create<float>(tensor->shape(), nullptr, tensorDimType));
-            if (tensor->getType().code == halide_type_float) {
+            if (tensor->getType().code == halide_type_float || tensor->getType().code == halide_type_bfloat) {
                 tDataType = QNN_DATATYPE_FLOAT_32;
             } else {
-                MNN_PRINT("MNN_QNN: Not supported data type in <QnnBackend::onAcquire>.\n");
+                MNN_PRINT("MNN_QNN: Not supported quant output type in <QnnBackend::onAcquire>.\n");
+                MNN_PRINT("MNN_QNN: quant output code=%d bits=%d usage=%d index=%d dims=%d\n",
+                          tensor->getType().code, tensor->getType().bits,
+                          (int)TensorUtils::getDescribe(tensor)->usage,
+                          TensorUtils::getDescribe(tensor)->index, tensor->dimensions());
                 return nullptr;
             }
             Qnn_QuantizeParams_t tQuantizeParamstmp = QNN_QUANTIZE_PARAMS_INIT;
@@ -1536,10 +1583,10 @@ Backend::MemObj* QnnBackend::onAcquire(const Tensor* tensor, StorageType storage
             mOutputTensorIndexes.push_back(mTensorCounter);
             qnnOutputTensorWrapper->alloc(tensorDimType);
         } else{
-            if (mUseFP16 && tensor->getType().code == halide_type_float) {
-                mTensorCounter += 1;
-                std::shared_ptr<Tensor> stageTensor;
-                stageTensor.reset(Tensor::create<float>(tensor->shape(), nullptr, tensorDimType));
+        if (mUseFP16 && (tensor->getType().code == halide_type_float || tensor->getType().code == halide_type_bfloat)) {
+            mTensorCounter += 1;
+            std::shared_ptr<Tensor> stageTensor;
+            stageTensor.reset(Tensor::create<float>(tensor->shape(), nullptr, tensorDimType));
                 Qnn_QuantizeParams_t tQuantizeParamstmp = QNN_QUANTIZE_PARAMS_INIT;
                 std::shared_ptr<QNNTensorWrapper> qnnCastTensorWrapper = QNNTensorWrapper::create(tName, QNN_TENSOR_TYPE_APP_READ, QNN_DATATYPE_FLOAT_32, tDims, tQuantizeParamstmp);
                 CALL_QNN(mRuntime->mQnnInterface.tensorCreateGraphTensor(mQnnGraphHandle, qnnCastTensorWrapper->getNativeTensor()));
@@ -1744,9 +1791,10 @@ int QnnBackend::getTensorIdx(const Tensor * tensor) const {
         if (tensor->getType().code == halide_type_int && tensor->getType().bits == 32) {
             tDataType = QNN_DATATYPE_INT_32;
             qnnTensorWrapper = QNNTensorWrapper::createStaticTensor(tName, tDataType, tDims, tensor->host<int>());
-        } else if (tensor->getType().code == halide_type_float) {
+        } else if ((tensor->getType().code == halide_type_float || tensor->getType().code == halide_type_bfloat)) {
             tDataType = mUseFP16 ? QNN_DATATYPE_FLOAT_16 : QNN_DATATYPE_FLOAT_32;
-            qnnTensorWrapper = QNNTensorWrapper::createStaticFloatTensor(tName, tDataType, tDims, tensor->host<float>());
+            auto floatBuffer = _tensorToFloatBuffer(tensor);
+            qnnTensorWrapper = QNNTensorWrapper::createStaticFloatTensor(tName, tDataType, tDims, floatBuffer.data());
         } else {
             MNN_ASSERT(false);
         }
@@ -1787,8 +1835,8 @@ Qnn_Tensor_t* QnnBackend::getMaskTensor(int maxKVSize) {
     return mMaskTensor->getNativeTensor();
 }
 
-Qnn_Tensor_t* QnnBackend::addExtraInput(Tensor* tensor) {
-    auto qnntensor = QNNTensorWrapper::create("", QNN_TENSOR_TYPE_APP_WRITE, QNN_DATATYPE_FLOAT_16, tensor->shape());
+Qnn_Tensor_t* QnnBackend::addExtraInput(Tensor* tensor, Qnn_DataType_t dataType) {
+    auto qnntensor = QNNTensorWrapper::create("", QNN_TENSOR_TYPE_APP_WRITE, dataType, tensor->shape());
     qnntensor->setName(gExtraIoPrefix+"_i" + std::to_string(mExtraInputs.size()));
     qnntensor->getNativeTensor()->v1.memType = QNN_TENSORMEMTYPE_MEMHANDLE;
     mExtraInputs.emplace_back(qnntensor);
@@ -1796,8 +1844,8 @@ Qnn_Tensor_t* QnnBackend::addExtraInput(Tensor* tensor) {
 
     return qnntensor->getNativeTensor();
 }
-Qnn_Tensor_t* QnnBackend::addExtraOutput(Tensor* tensor) {
-    auto qnntensor = QNNTensorWrapper::create("", QNN_TENSOR_TYPE_APP_READ, QNN_DATATYPE_FLOAT_16, tensor->shape());
+Qnn_Tensor_t* QnnBackend::addExtraOutput(Tensor* tensor, Qnn_DataType_t dataType) {
+    auto qnntensor = QNNTensorWrapper::create("", QNN_TENSOR_TYPE_APP_READ, dataType, tensor->shape());
     qnntensor->setName(gExtraIoPrefix+"_o" + std::to_string(mExtraOutputs.size()));
     qnntensor->getNativeTensor()->v1.memType = QNN_TENSORMEMTYPE_MEMHANDLE;
     mExtraOutputs.emplace_back(qnntensor);

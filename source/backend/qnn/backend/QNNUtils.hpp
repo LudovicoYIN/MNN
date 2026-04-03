@@ -109,6 +109,7 @@ extern void ___QNNBroadcastToCreator__OpType_BroadcastTo__();
 extern void ___QNNMatMulCreator__OpType_MatMul__();
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
 extern void ___QNNAttentionCreator__OpType_Attention__();
+extern void ___QNNLinearAttentionCreator__OpType_LinearAttention__();
 #endif
 extern void ___QNNQuantCreator__OpType_FloatToInt8__();
 extern void ___QNNDeQuantCreator__OpType_Int8ToFloat__();

@@ -261,17 +261,26 @@ std::vector<std::string> QNNTranslator::TranslateTensor(const QNNCommandTensor& 
     bool hasClientBuf = (cmdT.clientBuf.data != nullptr) ? true : false;
     bool hasQuant = (cmdT.quantizeParams.encodingDefinition == QNN_DEFINITION_DEFINED) ? true : false;
     bool shouldBeAdded = (cmdT.type == Qnn_Convertor_Tensor_t::TENSOR_INPUT) || (cmdT.type == Qnn_Convertor_Tensor_t::TENSOR_STATIC);
+    uint32_t normalizedRank = cmdT.rank;
+    uint32_t scalarDim = 1;
+    const uint32_t* normalizedDimensions = cmdT.dimensions;
+    if (normalizedRank == 0) {
+        // QNN compose rejects rank-0 tensors in shape helper paths. Export MNN
+        // scalars as rank-1 {1}; buffer size remains unchanged.
+        normalizedRank = 1;
+        normalizedDimensions = &scalarDim;
+    }
 
     std::vector<std::string> result;
 
     result.push_back("");
     result.push_back("  // Adding Tensor for " + sName + ".");
-    result.push_back(QNNTranslator::TranslateDimensionsArray(dimensionsNameSymbol, cmdT.rank, cmdT.dimensions));
+    result.push_back(QNNTranslator::TranslateDimensionsArray(dimensionsNameSymbol, normalizedRank, normalizedDimensions));
     if (isParam) {
         result.push_back(QNNTranslator::TranslateParamDataArray(dataNameSymbol, cmdT.dataType, cmdT.clientBuf));
     }
     if(hasQuant){
-        std::vector<std::string> linesQuantScaleOffset = TranslateQuantizeScaleOffsetDataArray(tensorNameSymbol, cmdT.quantizeParams, cmdT.rank, cmdT.dimensions);
+        std::vector<std::string> linesQuantScaleOffset = TranslateQuantizeScaleOffsetDataArray(tensorNameSymbol, cmdT.quantizeParams, normalizedRank, normalizedDimensions);
         APPEND_VECTOR(result, linesQuantScaleOffset);
     }
     result.push_back("  Qnn_Tensor_t " + tensorNameSymbol +   " = QNN_TENSOR_INIT;");
@@ -284,7 +293,7 @@ std::vector<std::string> QNNTranslator::TranslateTensor(const QNNCommandTensor& 
     result.push_back("  " + tensorNameSymbol + ".v1.dataType = " + QNNTranslator::MapDataType(cmdT.dataType) + ";");
     std::vector<std::string> linesQuant = QNNTranslator::TranslateTensorQuantizeParams(tensorNameSymbol, cmdT.quantizeParams);
     APPEND_VECTOR(result, linesQuant);
-    result.push_back("  " + tensorNameSymbol + ".v1.rank = " + std::to_string(cmdT.rank) + ";");
+    result.push_back("  " + tensorNameSymbol + ".v1.rank = " + std::to_string(normalizedRank) + ";");
     result.push_back("  " + tensorNameSymbol + ".v1.dimensions = " + dimensionsNameSymbol + ";");
     result.push_back("  " + tensorNameSymbol + ".v1.memType = QNN_TENSORMEMTYPE_RAW;");
     std::vector<std::string> linesClientBuf = QNNTranslator::TranslateTensorClientBuf(tensorNameSymbol, dataNameSymbol, sName, cmdT.clientBuf, hasClientBuf, isParam);

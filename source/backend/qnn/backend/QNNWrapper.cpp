@@ -12,8 +12,17 @@ namespace MNN {
 namespace QNN {
 #ifdef ENABLE_QNN_ONLINE_FINALIZE
 
+static std::vector<uint32_t> _normalizeQnnDimensions(const std::vector<uint32_t>& dimensions) {
+    if (!dimensions.empty()) {
+        return dimensions;
+    }
+    // QNN compose rejects rank-0 tensors for shape helper paths. Represent
+    // MNN scalars as rank-1 {1}; buffer size remains unchanged.
+    return {1};
+}
+
 std::shared_ptr<QNNTensorWrapper> QNNTensorWrapper::create(const std::string & name, Qnn_TensorType_t type, Qnn_DataType_t dataType, const std::vector<uint32_t> & dimensions, Qnn_QuantizeParams_t quantize) {
-    return std::make_shared<QNNTensorWrapper>(name, type, dataType, dimensions, quantize);
+    return std::make_shared<QNNTensorWrapper>(name, type, dataType, _normalizeQnnDimensions(dimensions), quantize);
 }
 
 std::shared_ptr<QNNTensorWrapper> QNNTensorWrapper::create(const std::string & name, Qnn_TensorType_t type, Qnn_DataType_t dataType, const std::vector<int> & dimensions, Qnn_QuantizeParams_t quantize) {
@@ -25,13 +34,14 @@ std::shared_ptr<QNNTensorWrapper> QNNTensorWrapper::create(const std::string & n
 }
 
 std::shared_ptr<QNNTensorWrapper> QNNTensorWrapper::createStaticTensor(const std::string & name, Qnn_DataType_t dataType, const std::vector<uint32_t> & dimensions, const void * buffer, Qnn_QuantizeParams_t quantizeParam) {
-    MNN_ASSERT(!name.empty() && !dimensions.empty() && buffer);
+    auto normalizedDimensions = _normalizeQnnDimensions(dimensions);
+    MNN_ASSERT(!name.empty() && !normalizedDimensions.empty() && buffer);
     MNN_ASSERT(dataType == QNN_DATATYPE_SFIXED_POINT_8 || dataType == QNN_DATATYPE_INT_32 || dataType == QNN_DATATYPE_UINT_32 || dataType == QNN_DATATYPE_SFIXED_POINT_32 || dataType == QNN_DATATYPE_UFIXED_POINT_8 || dataType == QNN_DATATYPE_UFIXED_POINT_16);
 
-    std::shared_ptr<QNNTensorWrapper> tensorWrapper = QNNTensorWrapper::create(name, QNN_TENSOR_TYPE_STATIC, dataType, dimensions, quantizeParam);
+    std::shared_ptr<QNNTensorWrapper> tensorWrapper = QNNTensorWrapper::create(name, QNN_TENSOR_TYPE_STATIC, dataType, normalizedDimensions, quantizeParam);
     uint32_t numElement = 1;
-    for (int i = 0; i < dimensions.size(); i++) {
-        numElement *= dimensions[i];
+    for (int i = 0; i < normalizedDimensions.size(); i++) {
+        numElement *= normalizedDimensions[i];
     }
     void * dst = tensorWrapper->alloc();
     uint32_t dataSize = gQnnTypeSize.find(dataType)->second;
@@ -40,12 +50,13 @@ std::shared_ptr<QNNTensorWrapper> QNNTensorWrapper::createStaticTensor(const std
 }
 
 std::shared_ptr<QNNTensorWrapper> QNNTensorWrapper::createStaticFloatTensor(const std::string & name, Qnn_DataType_t dataType, const std::vector<uint32_t> & dimensions, const float * buffer, Qnn_QuantizeParams_t quantize) {
-    MNN_ASSERT(!name.empty() && !dimensions.empty() && buffer != nullptr);
+    auto normalizedDimensions = _normalizeQnnDimensions(dimensions);
+    MNN_ASSERT(!name.empty() && !normalizedDimensions.empty() && buffer != nullptr);
     MNN_ASSERT(dataType == QNN_DATATYPE_FLOAT_16 || dataType == QNN_DATATYPE_FLOAT_32);
-    std::shared_ptr<QNNTensorWrapper> tensorWrapper = QNNTensorWrapper::create(name, QNN_TENSOR_TYPE_STATIC, dataType, dimensions, quantize);
+    std::shared_ptr<QNNTensorWrapper> tensorWrapper = QNNTensorWrapper::create(name, QNN_TENSOR_TYPE_STATIC, dataType, normalizedDimensions, quantize);
     uint32_t numElement = 1;
-    for (int i = 0; i < dimensions.size(); i++) {
-        numElement *= dimensions[i];
+    for (int i = 0; i < normalizedDimensions.size(); i++) {
+        numElement *= normalizedDimensions[i];
     }
 
     if (dataType == QNN_DATATYPE_FLOAT_32) {

@@ -149,9 +149,10 @@ void registerQNNOps() {
 
     ___QNNBroadcastToCreator__OpType_BroadcastTo__();
     ___QNNMatMulCreator__OpType_MatMul__();
-    #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
+#ifdef MNN_SUPPORT_TRANSFORMER_FUSE
     ___QNNAttentionCreator__OpType_Attention__();
-    #endif
+    ___QNNLinearAttentionCreator__OpType_LinearAttention__();
+#endif
     ___QNNQuantCreator__OpType_FloatToInt8__();
     ___QNNDeQuantCreator__OpType_Int8ToFloat__();
 }
