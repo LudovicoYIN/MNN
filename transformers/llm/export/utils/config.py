@@ -24,6 +24,7 @@ class LlmConfig(PretrainedConfig):
         self.attention_type = kwargs.pop("attention_type", 'full')
         self.tie_word_embeddings = kwargs.pop("tie_word_embeddings", False)
         self.conv_L_cache = kwargs.pop("conv_L_cache", 0)
+        self.rope_parameters = kwargs.pop("rope_parameters", None)
         self.model_map = kwargs.pop("model_map", {})
         super().__init__(**kwargs)
 
@@ -91,11 +92,13 @@ class LlmConfig(PretrainedConfig):
             else:
                 llm_config.head_dim = llm_config.hidden_size // llm_config.num_attention_heads
 
-        # Determine attention type
+        # Determine attention type.
+        # Qwen3.5 mixed-attention models mark non-full layers as
+        # `linear_attention`; reuse the existing mix path for them.
         sliding_attn_layers = []
         if hasattr(llm_config, 'layer_types') and llm_config.layer_types:
             for i in range(len(llm_config.layer_types)):
-                if llm_config.layer_types[i] == 'sliding_attention':
+                if llm_config.layer_types[i] in ('sliding_attention', 'linear_attention'):
                     sliding_attn_layers.append(i)
 
         if llm_config.num_hidden_layers and len(sliding_attn_layers) >= llm_config.num_hidden_layers:

@@ -12,13 +12,14 @@
 #include <iomanip>
 #include <unordered_set>
 
+#include "prompt_cache_utils.hpp"
 #include <MNN/AutoTime.hpp>
+#include "core/TensorUtils.hpp"
 #include "cpp/ExprDebug.hpp"
 #include "llm/llm.hpp"
 #include "kvmeta.hpp"
 #include "llmconfig.hpp"
-#include "prompt.hpp"
-#include "tokenizer.hpp"
+#include "tokenizer/tokenizer.hpp"
 #include "diskembedding.hpp"
 #include "sampler.hpp"
 #include "omni.hpp"
@@ -32,18 +33,6 @@
 namespace MNN {
 using namespace Express;
 namespace Transformer {
-
-void KVMeta::sync() {
-    int revertNumber = 0;
-    for (int i=0; i<n_reserve; ++i) {
-        revertNumber += reserve[2*i+1];
-    }
-    previous = previous - remove + add + revertNumber;
-    n_reserve = 0;
-    reserve = nullptr;
-    remove = 0;
-    add = 0;
-}
 
 static MNNForwardType backend_type_convert(const std::string& type_str) {
     if (type_str == "cpu")
@@ -86,30 +75,34 @@ std::string Llm::dump_config() {
     return mConfig->config_.dump();
 }
 
-bool Llm::set_config(const std::string& content) {
-    auto res = mConfig->config_.merge(content.c_str());
-    // update prompt
-    if(mPrompt != nullptr) {
-        mPrompt->setParams(mConfig);
-    } else {
-        mPrompt.reset(Prompt::createPrompt(mContext, mConfig));
+void Llm::setChatTemplate() {
+    if (!mTokenizer || !mConfig->config_.contains("jinja")) return;
+    auto jinja = mConfig->config_["jinja"];
+    if (jinja.contains("chat_template")) {
+        std::string context;
+        if (jinja.contains("context")) {
+            context = jinja["context"].dump();
+        }
+        mTokenizer->set_chat_template(jinja["chat_template"].get<std::string>(), jinja.value("eos", ""), context);
     }
-    mAsync = mConfig->config_.document.HasMember("async") ? mConfig->config_.document["async"].GetBool() : true;
+}
+
+bool Llm::set_config(const std::string& content) {
+    mConfig->config_.merge(ujson::json::parse(content));
+    setChatTemplate();
+    mAsync = mConfig->config_.value("async", true);
     mGenerateParam->timeout_ms = mConfig->timeout_ms();
     mValidBlockSize.clear();
-    mBlockSize = 0;
-    if (mConfig->config_.document.HasMember("chunk")) {
-        mBlockSize = mConfig->config_.document["chunk"].GetInt();
-    }
-    if (mConfig->config_.document.HasMember("chunk_limits")) {
-        auto& size_limit = mConfig->config_.document["chunk_limits"];
+    mBlockSize = mConfig->config_.value("chunk", 0);
+    if (mConfig->config_.contains("chunk_limits")) {
+        auto size_limit = mConfig->config_["chunk_limits"];
         do {
-            if (!size_limit.IsArray()) {
+            if (!size_limit.is_array()) {
                 MNN_ERROR("size_limit must be array, eg: [128, 1]\n");
                 break;
             }
-            for (auto iter = size_limit.GetArray().begin(); iter != size_limit.GetArray().end(); iter++) {
-                mValidBlockSize.emplace_back(iter->GetInt());
+            for (size_t i = 0; i < size_limit.size(); i++) {
+                mValidBlockSize.emplace_back(size_limit[i].get<int>());
             }
             if (mValidBlockSize.size() < 2) {
                 MNN_ERROR("size_limit must be array larger than 1, eg: [128, 1]\n");
@@ -120,7 +113,11 @@ bool Llm::set_config(const std::string& content) {
             mBlockSize = mValidBlockSize[mValidBlockSize.size()-1];
         } while (false);
     }
-    return res;
+    return true;
+}
+
+void Llm::setDebugCallback(MNN::TensorCallBackWithInfo&& before, MNN::TensorCallBackWithInfo&& after) {
+    mExecutor->setCallBack(std::move(before), std::move(after));
 }
 
 void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg) {
@@ -160,6 +157,7 @@ void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg
     }
     rtg->setHint(MNN::Interpreter::CPU_SME2_NEON_DIVISION_RATIO, mConfig->config_.value("cpu_sme2_neon_division_ratio", 41));
     rtg->setHint(MNN::Interpreter::CPU_SME_CORES, mConfig->config_.value("cpu_sme_core_num", 2));
+    rtg->setHint(MNN::Interpreter::MMAP_FILE_SIZE, mConfig->mmap_size());
 }
 
 void Llm::initRuntime() {
@@ -276,20 +274,23 @@ bool Llm::load() {
             contextStream << contextFile.rdbuf();
             auto contextStr = contextStream.str();
             // check valid json
-            rapidjson::Document contextDoc;
-            contextDoc.Parse(contextStr.c_str());
-            if (!contextDoc.HasParseError()) {
+            auto contextJson = ujson::json::parse(contextStr);
+            if (!contextJson.is_null()) {
                 std::string config_json = R"({
                     "jinja": {
                         "context": )" + contextStr + R"(
                     }
                 })";
-                mConfig->config_.merge(config_json.c_str());
+                mConfig->config_.merge(ujson::json::parse(config_json));
             }
         }
     }
     mDiskEmbedding.reset(new DiskEmbedding(mConfig));
-    mPrompt.reset(Prompt::createPrompt(mContext, mConfig));
+    // PLE (Per-Layer Embeddings) for gemma4
+    if (mConfig->has_ple()) {
+        mPleEmbedding.reset(new DiskEmbedding(mConfig, mConfig->ple_embed_file(), mConfig->ple_embed_dim(), mConfig->ple_quant()));
+    }
+    setChatTemplate();
     mSampler.reset(Sampler::createSampler(mContext, mConfig));
     // 3. load model
     Module::Config module_config;
@@ -309,10 +310,7 @@ bool Llm::load() {
     if (mConfig->has_talker()) {
         outputNames.emplace_back("talker_embeds");
     }
-    bool needHiddenState = false;
-    if (mConfig->config_.document.HasMember("hidden_states")) {
-        needHiddenState = mConfig->config_.document["hidden_states"].GetBool();
-    }
+    bool needHiddenState = mConfig->config_.value("hidden_states", false);
     if(mConfig->speculative_type() == "mtp") {
         needHiddenState = true;
     }
@@ -323,6 +321,9 @@ bool Llm::load() {
     mRuntimeManager->setExternalFile(weight_path);
     if (mConfig->has_deepstack()) {
         inputNames.emplace_back("deepstack_embeds");
+    }
+    if (mConfig->has_ple()) {
+        inputNames.emplace_back("ple_embeddings");
     }
     mModule.reset(Module::load(inputNames, outputNames, model_path.c_str(), mRuntimeManager, &module_config));
     mRuntimeManager->setExternalFile("");
@@ -625,11 +626,16 @@ std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
     MNN::Express::ExecutorScope s(mExecutor);
     
     int seq_len         = input_embeds->getInfo()->dim[mSeqLenIndex];
+    // Prepare PLE extra arg
+    Express::VARPS extraArgs;
+    if (mPleInput.get()) {
+        extraArgs.push_back(mPleInput);
+    }
     if (0 == mBlockSize) {
         mMeta->add = seq_len;
         auto attention_mask = gen_attention_mask(seq_len);
         auto position_ids = gen_position_ids(seq_len);
-        auto res = forwardRaw(input_embeds, attention_mask, position_ids);
+        auto res = forwardRaw(input_embeds, attention_mask, position_ids, extraArgs);
         return res;
     }
     // For decode can't support seq_len <= mBlockSize
@@ -655,13 +661,22 @@ std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
         embeddings = {input_embeds};
     }
     int addSize = blockSize;
+    // Split PLE if needed
+    std::vector<VARP> pleChunks;
+    if (mPleInput.get() && sizeSplits.size() > 1) {
+        pleChunks = MNN::Express::_Split(mPleInput, sizeSplits, 1); // split on seq_len dim (dim=1)
+    } else if (mPleInput.get()) {
+        pleChunks = {mPleInput};
+    }
     for (int i=0; i<blockNumber; ++i) {
         logits.clear();
         mMeta->add = blockSize;
         auto embed = embeddings[i];
         auto attention_mask = gen_attention_mask(blockSize);
         auto position_ids = gen_position_ids(blockSize);
-        logits = forwardRaw(embed, attention_mask, position_ids);
+        Express::VARPS blockExtraArgs;
+        if (!pleChunks.empty()) blockExtraArgs.push_back(pleChunks[i]);
+        logits = forwardRaw(embed, attention_mask, position_ids, blockExtraArgs);
         if(logits.empty()) {
             return logits;
         }
@@ -695,7 +710,9 @@ std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
         }
         auto attention_mask = gen_attention_mask(forwardSize);
         auto position_ids = gen_position_ids(forwardSize);
-        logits = forwardRaw(input_embeds, attention_mask, position_ids);
+        Express::VARPS remainExtraArgs;
+        if (!pleChunks.empty()) remainExtraArgs.push_back(pleChunks.back());
+        logits = forwardRaw(input_embeds, attention_mask, position_ids, remainExtraArgs);
         if(logits.empty()) {
             return logits;
         }
@@ -737,6 +754,7 @@ void Llm::reset() {
     mContext->audio_us = 0;
     mContext->audio_input_s = 0.0f;
     mMeta->remove = mMeta->previous;
+    mCachedPromptText.clear();
 }
 
 void Llm::generate_init(std::ostream* os, const char* end_with) {
@@ -851,7 +869,9 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
             if(hidden_states == nullptr) {
                 return {};
             }
-            return generate(hidden_states, max_tokens);
+            auto result = generate(hidden_states, max_tokens);
+            completePrefixWrite();
+            return result;
         }
         int total_size = (int)input_ids.size();
         int loop_size = UP_DIV(total_size, mBlockSize);
@@ -868,6 +888,7 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
             }
             generate(input_embeds, 0);
         }
+        completePrefixWrite();
     } else {
         // update states
         updateContext((int)input_ids.size(), 0);
@@ -879,11 +900,11 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
 }
 
 std::string Llm::apply_chat_template(const std::string& user_content) const {
-    return mPrompt->applyTemplate(user_content, true);
+    return mTokenizer->apply_chat_template(user_content, mConfig->system_prompt());
 }
 
 std::string Llm::apply_chat_template(const ChatMessages& chat_prompts) const {
-    return mPrompt->applyTemplate(chat_prompts, true);
+    return mTokenizer->apply_chat_template(chat_prompts, true);
 }
 
 std::vector<int> Llm::tokenizer_encode(const std::string& user_content) {
@@ -900,7 +921,7 @@ void Llm::response(const MultimodalPrompt& multimodal_input,
     MNN::Express::ExecutorScope s(mExecutor);
     auto multimodal_input_copy = multimodal_input;
     if (mConfig->use_template()) {
-        multimodal_input_copy.prompt_template = mPrompt->applyTemplate(multimodal_input_copy.prompt_template, true);
+        multimodal_input_copy.prompt_template = apply_chat_template(multimodal_input_copy.prompt_template);
     }
     std::vector<int> input_ids = tokenizer_encode(multimodal_input_copy);
     response(input_ids, os, end_with, max_new_tokens);
@@ -922,7 +943,6 @@ std::vector<int> Llm::generate(MNN::Express::VARP input_embeds, int max_tokens) 
         mContext->status = LlmStatus::INTERNAL_ERROR;
         return {};
     }
-    
     updateContext(seqLen, 0);
     mContext->prefill_us += _t.durationInUs();
     MNN::Express::ExecutorScope::Current()->gc(); // after prefill
@@ -996,7 +1016,7 @@ void Llm::response(const std::string& user_content, std::ostream* os, const char
     MNN::Express::ExecutorScope s(mExecutor);
     auto prompt = user_content;
     if (mConfig->use_template()) {
-        prompt = mPrompt->applyTemplate(user_content, true);
+        prompt = apply_chat_template(user_content);
         if (prompt.empty()) {
             prompt = user_content;
         }
@@ -1011,9 +1031,132 @@ void Llm::response(const ChatMessages& chat_prompts, std::ostream* os, const cha
     if (chat_prompts.empty()) {
         return;
     }
-    auto prompt = mPrompt->applyTemplate(chat_prompts);
-    std::vector<int> input_ids = tokenizer_encode(prompt);
-    response(input_ids, os, end_with, max_new_tokens);
+    auto prompt = apply_chat_template(chat_prompts);
+
+    // Prompt cache: compare current prompt text against the previous turn's to
+    // find the common prefix, then only tokenize and prefill the new suffix.
+    if (mConfig->prompt_cache() && !mCachedPromptText.empty()) {
+        // Use add_generation_prompt=false for comparison to avoid enable_thinking
+        // asymmetry: the template adds <think> to the LAST assistant message only
+        // when true. Using false renders all messages consistently.
+        auto prompt_for_compare = mTokenizer->apply_chat_template(chat_prompts, false);
+        size_t text_common = 0;
+        size_t text_max = std::min(mCachedPromptText.size(), prompt_for_compare.size());
+        while (text_common < text_max && mCachedPromptText[text_common] == prompt_for_compare[text_common])
+            text_common++;
+
+        // If history was trimmed (text_common < cached), fall back to full
+        // re-prefill rather than conditioning on stale KV entries.
+        if (text_common < mCachedPromptText.size()) {
+            // History was trimmed — clear all stale state and do full re-prefill.
+            mCachedPromptText.clear();
+            mContext->all_seq_len = 0;
+            mContext->history_tokens.clear();
+            mMeta->remove = mMeta->previous;
+            std::vector<int> input_ids = tokenizer_encode(prompt);
+            size_t history_before = input_ids.size(); // generate() pushes these first
+            response(input_ids, os, end_with, max_new_tokens);
+            if (mConfig->prompt_cache()) {
+                updateCachedPromptText(chat_prompts, history_before);
+            }
+            return;
+        }
+
+        // Tokenize the full prompt and split at a token boundary rather than
+        // tokenizing a text substring (which can land mid-token for BPE/UTF-8).
+        std::vector<int> full_tokens = tokenizer_encode(prompt);
+        // Detect prefix token count (BOS, etc.) by encoding an empty string.
+        // tokenizer_encode("") returns only the prefix tokens that are
+        // automatically prepended to every input (e.g., <|begin_of_text|>).
+        // This count is used to skip prefix tokens when mapping text
+        // positions to token indices, since they don't correspond to any
+        // prompt text bytes. Assumption: prefix tokens are constant across
+        // inputs for a given tokenizer configuration.
+        size_t prefix_count = tokenizer_encode("").size();
+        size_t char_pos = 0;
+        size_t token_split = prefix_count; // start after prefix tokens
+        for (size_t i = prefix_count; i < full_tokens.size(); i++) {
+            std::string piece = tokenizer_decode(full_tokens[i]);
+            if (char_pos + piece.size() > text_common)
+                break;
+            char_pos += piece.size();
+            token_split++;
+        }
+        std::vector<int> delta(full_tokens.begin() + token_split, full_tokens.end());
+        MNN_PRINT("[prompt_cache] cached=%d, compare=%d, common=%d, token_split=%d, delta=%d\n",
+                  (int)mCachedPromptText.size(), (int)prompt_for_compare.size(), (int)text_common, (int)token_split,
+                  (int)delta.size());
+
+        // Save/restore KV state across generate_init — only the delta path
+        // should preserve KV; other response() overloads clear as normal.
+        // Also preserve mMeta->remove so that a pending eraseHistory() (from
+        // a prior cancelled decode) is not silently cleared before sync().
+        int saved_all_seq_len = mContext->all_seq_len;
+        auto saved_history = std::move(mContext->history_tokens);
+        size_t saved_previous = mMeta->previous;
+        size_t saved_remove = mMeta->remove;
+        generate_init(os, end_with);
+        mContext->all_seq_len = saved_all_seq_len;
+        mContext->history_tokens = std::move(saved_history);
+        mMeta->previous = saved_previous;
+        mMeta->remove = saved_remove;
+        CHECK_LLM_RUNNING(mContext);
+        // history_before must account for the delta tokens that generate()
+        // pushes into history_tokens before decode starts, so that
+        // updateCachedPromptText only sees the assistant response tokens.
+        size_t history_before = mContext->history_tokens.size() + delta.size();
+        generate(delta, max_new_tokens);
+
+        // Update cache after generation so non-Android callers (llm_demo,
+        // mls) don't need to call syncPromptCache() externally.
+        updateCachedPromptText(chat_prompts, history_before);
+    } else {
+        // First turn or prompt_cache disabled: full tokenization, full prefill.
+        // Clear any existing KV state before a full re-prefill. generate_init()
+        // only clears KV when reuse_kv=false, so handle reuse_kv=true here.
+        if (mContext->all_seq_len > 0) {
+            mContext->all_seq_len = 0;
+            mContext->history_tokens.clear();
+            mMeta->remove = mMeta->previous;
+        }
+        std::vector<int> input_ids = tokenizer_encode(prompt);
+        // history_before accounts for input_ids that generate() pushes first
+        size_t history_before = input_ids.size();
+        response(input_ids, os, end_with, max_new_tokens);
+        if (mConfig->prompt_cache()) {
+            updateCachedPromptText(chat_prompts, history_before);
+        } else {
+            // Cache text must not survive while caching is disabled —
+            // if re-enabled later, stale text would mismatch the KV state
+            // that was rebuilt from scratch on each turn while disabled.
+            mCachedPromptText.clear();
+        }
+    }
+}
+
+void Llm::updateCachedPromptText(const ChatMessages& chat_prompts, size_t history_before) {
+    // Re-render the template with the assistant response included.
+    // Response tokens = history_tokens[history_before:] — the entries added
+    // during generate(). Using history_before (snapshot before generate) rather
+    // than gen_seq_len because Eagle's gen_seq_len can be stale on the final
+    // accepted batch (updateDraft is not called on the terminal iteration).
+    // history_tokens is correct for ALL decode paths:
+    // - ArGeneration, Lookahead, MTP, Eagle all write to it
+    // - Eagle's step counter is only in output_tokens, not history_tokens
+    // - mTokenizer->is_stop() avoids Llm::is_stop() TIMEOUT/CANCEL guard
+    ChatMessages msgs_with_response(chat_prompts.begin(), chat_prompts.end());
+    std::string response_text;
+    for (size_t i = history_before; i < mContext->history_tokens.size(); i++) {
+        int tok = mContext->history_tokens[i];
+        if (mTokenizer->is_stop(tok))
+            continue;
+        response_text += tokenizer_decode(tok);
+    }
+    if (!response_text.empty()) {
+        msgs_with_response.emplace_back("assistant", response_text);
+    }
+    mCachedPromptText = mTokenizer->apply_chat_template(msgs_with_response, false);
+    MNN::Transformer::stripThinkBlocks(mCachedPromptText);
 }
 
 Llm::Llm(std::shared_ptr<LlmConfig> config) : mConfig(config) {
@@ -1022,6 +1165,7 @@ Llm::Llm(std::shared_ptr<LlmConfig> config) : mConfig(config) {
     mContext.reset(new LlmContext);
     mMeta.reset(new KVMeta);
     mMeta->layer_nums = mConfig->layer_nums();
+    mMeta->attn_scale = mConfig->attn_scale();
     mGenerateParam.reset(new GenerationParams);
     mGenerateParam->timeout_ms = mConfig->timeout_ms();
 }
@@ -1077,7 +1221,43 @@ bool Llm::setPrefixCacheFile(const std::string& filename, int flag) {
     return mIsPrefixFileExist;
 }
 
+void Llm::completePrefixWrite() {
+    if (!mPrefixCacheMode || mCallIndex != 1 || mIsPrefixFileExist) {
+        return;
+    }
+    mMeta->file_flag = KVMeta::NoChange;
+    mMeta->file_name = "";
+    mMeta->layer_index = 0;
+    // Create sync files to mark prefix cache as valid
+    auto prefixDir = mConfig->prefix_cache_path();
+    for (int i = 0; i < mConfig->layer_nums(); i++) {
+        auto base = MNNFilePathConcat(prefixDir, mPrefixCacheFileName) + "_" + std::to_string(i);
+        auto k_file = base + ".k";
+        if (MNNFileExist(k_file.c_str())) {
+            auto k_sync = base + "_sync.k";
+            auto fd = MNNCreateFile(k_sync.c_str());
+            if (fd != INVALID_FILE) { MNNCloseFile(fd); }
+        }
+        auto v_file = base + ".v";
+        if (MNNFileExist(v_file.c_str())) {
+            auto v_sync = base + "_sync.v";
+            auto fd = MNNCreateFile(v_sync.c_str());
+            if (fd != INVALID_FILE) { MNNCloseFile(fd); }
+        }
+    }
+}
+
 bool Llm::reuse_kv() { return mConfig->reuse_kv(); }
+
+void Llm::syncPromptCache(const ChatMessages& chat_prompts) {
+    if (!mConfig->prompt_cache() || chat_prompts.empty())
+        return;
+    // Override cached text with caller-provided messages (e.g. after
+    // deleteThinkPart processing in Android). Uses the same rendering
+    // and <think> stripping as updateCachedPromptText.
+    mCachedPromptText = mTokenizer->apply_chat_template(chat_prompts, false);
+    MNN::Transformer::stripThinkBlocks(mCachedPromptText);
+}
 
 static inline bool needNewVar(VARP var, int axis, int seq_len, int kv_seq_len = 0) {
     if (var == nullptr) {
@@ -1101,6 +1281,20 @@ VARP Llm::embedding(const std::vector<int>& input_ids) {
     VARP res = _Input({seq_len, 1, hidden_size}, NCHW);
     // disk embedding to save memory
     mDiskEmbedding->embedding(input_ids, res->writeMap<float>());
+    // scale_emb is in ONNX model, not here. C++ passes raw embedding.
+
+    // PLE embedding lookup (gemma4)
+    // mPleInput may be pre-set by Omni::embedding for multimodal prefill;
+    // update only if null or if seq_len matches (decode single token)
+    if (mPleEmbedding && (!mPleInput.get() || seq_len == 1)) {
+        int ple_dim = mConfig->ple_embed_dim();
+        float ple_scale = mConfig->ple_embed_scale();
+        mPleInput = _Input({1, seq_len, ple_dim}, NCHW);
+        mPleEmbedding->embedding(input_ids, mPleInput->writeMap<float>());
+        if (ple_scale != 1.0f) {
+            mPleInput = mPleInput * _Scalar<float>(ple_scale);
+        }
+    }
     return res;
 }
 

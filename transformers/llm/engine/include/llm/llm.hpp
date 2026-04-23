@@ -25,13 +25,23 @@
 #include <MNN/expr/ExecutorScope.hpp>
 
 namespace MNN {
+struct KVMeta;
 namespace Transformer {
+using MNN::KVMeta;
+
+// ChatMessage: pair<role, content> for multi-turn conversation.
+//   first  = role: "system", "user", "assistant", "tool", etc.
+//   second = content: plain text message content.
+// For complex messages (tool_calls, reasoning_content, etc.):
+//   first  = "json"
+//   second = full JSON object string, e.g. {"role":"assistant","content":"","tool_calls":[...]}
+using ChatMessage = std::pair<std::string, std::string>;
+using ChatMessages = std::vector<ChatMessage>;
 class Tokenizer;
 class Pipeline;
 class LlmConfig;
 class DiskEmbedding;
 class Sampler;
-class Prompt;
 class Generation;
 class EagleGeneration;
 struct TimePerformance;
@@ -57,9 +67,6 @@ struct TimePerformance;
         return;                                                 \
     }                                                           \
 }
-
-using ChatMessage = std::pair<std::string, std::string>; // <role, content>
-using ChatMessages = std::vector<ChatMessage>;
 
 struct MNN_PUBLIC PromptImagePart {
     MNN::Express::VARP image_data;
@@ -94,7 +101,6 @@ enum class LlmStatus {
 enum class MatchStrictLevel : int;
 enum class NgramSelectRule : int;
 
-struct KVMeta;
 struct LlmContext {
     // forward
     int prompt_len = 0;
@@ -157,9 +163,15 @@ public:
     std::vector<int> generate(MNN::Express::VARP input_embeds, int max_tokens = -1);
     bool stoped();
     bool reuse_kv();
+    // Prompt cache: call after decode completes to sync the cached text with the
+    // full conversation (including assistant response). Optional — the cache
+    // self-updates after generate(), but this allows callers with post-processed
+    // response text (e.g. deleteThinkPart) to provide a more accurate version.
+    void syncPromptCache(const ChatMessages& chat_prompts);
     // config function
     std::string dump_config();
     bool set_config(const std::string& content);
+    void setDebugCallback(MNN::TensorCallBackWithInfo&& before, MNN::TensorCallBackWithInfo&& after);
     Llm* create_lora(const std::string& lora_path);
     // tokenier function
     bool is_stop(int token);
@@ -180,14 +192,17 @@ public:
     virtual void setWavformCallback(std::function<bool(const float*, size_t, bool)> callback) {}
     virtual void generateWavform() {}
 protected:
+    void setChatTemplate();
     void initRuntime();
     void setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg);
     std::shared_ptr<LlmContext> mContext;
     std::shared_ptr<KVMeta> mMeta;
     std::shared_ptr<LlmConfig> mConfig;
-    std::shared_ptr<Prompt> mPrompt;
     std::shared_ptr<Tokenizer> mTokenizer;
     std::shared_ptr<DiskEmbedding> mDiskEmbedding;
+    std::shared_ptr<DiskEmbedding> mPleEmbedding;
+    Express::VARP mPleInput; // PLE embeddings for current input
+    Express::VARP mTextEmbedsForPle; // Pure text embeddings for PLE projection
     std::shared_ptr<Sampler> mSampler;
     std::shared_ptr<Express::Executor::RuntimeManager> mRuntimeManager, mProcessorRuntimeManager;
     std::shared_ptr<Express::Module> mModule;
@@ -227,6 +242,10 @@ private:
     int mCallIndex;
     int mPrefixLength;
     bool mIsPrefixFileExist = false;
+    void completePrefixWrite();
+    // Prompt cache state
+    std::string mCachedPromptText;
+    void updateCachedPromptText(const ChatMessages& chat_prompts, size_t history_before);
 };
 
 // Embedding start

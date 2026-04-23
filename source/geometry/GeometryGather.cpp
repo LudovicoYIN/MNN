@@ -40,7 +40,9 @@ static void _computeGather(const std::vector<Tensor*>& inputs, const std::vector
         inside *= params->length(i);
     }
     const int limit = 3;
-    if (TensorUtils::getDescribe(indices)->usage == Tensor::InsideDescribe::CONSTANT && N < limit) {
+    auto indiceOrigin = TensorUtils::getDescribeOrigin(indices);
+    bool memoryInCPU = nullptr == indiceOrigin->getBackend() || indiceOrigin->getBackend()->type() == MNN_FORWARD_CPU || indiceOrigin->getBackend()->type() == MNN_FORWARD_CPU_EXTENSION;
+    if (TensorUtils::getDescribe(indices)->usage == Tensor::InsideDescribe::CONSTANT && N < limit && memoryInCPU) {
         // Use Raster instead of loop
         auto outDes = TensorUtils::getDescribe(output);
         outDes->memoryType = Tensor::InsideDescribe::MEMORY_VIRTUAL;
@@ -360,21 +362,23 @@ public:
             paramSize = dimCount;
         }
         // recompute reshape
-        auto des = TensorUtils::getDescribe(reshapeIndice.get());
-        des->extra.offset = 0;
-        des->memoryType = Tensor::InsideDescribe::MEMORY_VIRTUAL;
-        des->regions = {GeometryComputerUtils::makeRawAddressRef(indice, 0, mSliceN * indiceNd)};
+        auto des = TensorUtils::getDescribeOrigin(reshapeIndice.get());
+        des->offset = 0;
+        auto nativeDes = TensorUtils::getDescribe(reshapeIndice.get());
+        nativeDes->memoryType = Tensor::InsideDescribe::MEMORY_VIRTUAL;
+        nativeDes->regions = {GeometryComputerUtils::makeRawAddressRef(indice, 0, mSliceN * indiceNd)};
         // recompute broadcast
-        des = TensorUtils::getDescribe(broadcastStride.get());
-        des->extra.offset = 0;
-        des->memoryType = Tensor::InsideDescribe::MEMORY_VIRTUAL;
-        des->regions[0].origin = constStride.get();
-        des->regions[0].size[0] = 1;
-        des->regions[0].size[1] = mSliceN;
-        des->regions[0].size[2] = indiceNd;
-        des->regions[0].dst.stride[0] = indiceNd*mSliceN;
-        des->regions[0].dst.stride[1] = indiceNd;
-        des->regions[0].dst.stride[2] = 1;
+        des = TensorUtils::getDescribeOrigin(broadcastStride.get());
+        des->offset = 0;
+        nativeDes = TensorUtils::getDescribe(broadcastStride.get());
+        nativeDes->memoryType = Tensor::InsideDescribe::MEMORY_VIRTUAL;
+        nativeDes->regions[0].origin = constStride.get();
+        nativeDes->regions[0].size[0] = 1;
+        nativeDes->regions[0].size[1] = mSliceN;
+        nativeDes->regions[0].size[2] = indiceNd;
+        nativeDes->regions[0].dst.stride[0] = indiceNd*mSliceN;
+        nativeDes->regions[0].dst.stride[1] = indiceNd;
+        nativeDes->regions[0].dst.stride[2] = 1;
         // recompute loop
         auto loopCmd = cmd.command[cmd.command.size() - 1];
         auto param = loopCmd->op->main_as_LoopParam();
