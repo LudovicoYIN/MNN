@@ -900,6 +900,10 @@ def build_args(parser):
     parser.add_argument('--seperate_embed', action='store_true', help='For lm and embed shared model, whether or not to sepearte embed to avoid quant, default is False, if True, embed weight will be seperate to embedding bf16.bin.')
     parser.add_argument('--lora_split', action='store_true', help='Whether or not export lora split, default is False.')
     parser.add_argument('--calib_data', type=str, default=None, help='calibration data path, default is `None` mean not use calib data.')
+    parser.add_argument('--calib_use_chat_template', action='store_true', help='Wrap calibration text with the model chat template before tokenization.')
+    parser.add_argument('--calib_system_prompt', type=str, default='', help='System prompt used when calib_use_chat_template is enabled.')
+    parser.add_argument('--calib_enable_thinking', action='store_true', help='Enable thinking mode when applying chat template during calibration.')
+    parser.add_argument('--calib_disable_thinking', action='store_true', help='Disable thinking mode when applying chat template during calibration.')
     parser.add_argument('--act_bit', type=int, default=16, help='smooth quant act bit, 8 or 16, default is 16.')
     parser.add_argument('--embed_bit', type=int, default=16, choices=[16, 8, 4], help='embedding export bit precision, choices are 16 (bf16), 8 (int8), 4 (int4), default is 16.')
     parser.add_argument('--act_sym', action='store_true', help='smooth quant act us sym or not, default asym.')
@@ -928,6 +932,14 @@ def main():
     parser = argparse.ArgumentParser(description='llm_exporter', formatter_class=argparse.RawTextHelpFormatter)
     build_args(parser)
     args = parser.parse_args()
+    if args.calib_enable_thinking and args.calib_disable_thinking:
+        parser.error('--calib_enable_thinking and --calib_disable_thinking are mutually exclusive')
+    if args.calib_enable_thinking:
+        args.calib_enable_thinking = True
+    elif args.calib_disable_thinking:
+        args.calib_enable_thinking = False
+    else:
+        args.calib_enable_thinking = None
 
     model_path = args.path
 

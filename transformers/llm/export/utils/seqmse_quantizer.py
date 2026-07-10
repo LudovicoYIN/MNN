@@ -38,6 +38,9 @@ class SeqMSEQuantizer:
             n_samples=max_calib_samples,
             max_seq_len=max_calib_seq_len,
             split='train',
+            use_chat_template=getattr(self.model.args, "calib_use_chat_template", False),
+            calib_system_prompt=getattr(self.model.args, "calib_system_prompt", ""),
+            calib_enable_thinking=getattr(self.model.args, "calib_enable_thinking", None),
         )
         self.encodings = {}
         self.float_inputs = defaultdict(list)

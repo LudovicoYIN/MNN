@@ -108,6 +108,9 @@ class SmoothQuantizer:
         n_samples=128,
         max_seq_len=512,
         split="train",
+        use_chat_template=False,
+        calib_system_prompt="",
+        calib_enable_thinking=None,
     ):
         custom_calib_data = False
         if isinstance(data, str):
@@ -128,24 +131,34 @@ class SmoothQuantizer:
                 "that is preprocessed with one sample of text per element"
             )
 
+        def encode_chat_sample(text):
+            messages = [
+                {"role": "system", "content": calib_system_prompt},
+                {"role": "user", "content": text},
+            ]
+            template_kwargs = {}
+            if calib_enable_thinking is not None:
+                template_kwargs["enable_thinking"] = calib_enable_thinking
+            prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+            return tokenizer(
+                prompt, return_tensors="pt", max_length=max_seq_len, truncation=True
+            ).input_ids
+
         samples = []
         if custom_calib_data == False:
             dataset = dataset.shuffle(seed=42)
             for i in range(n_samples):
-                input_ids = tokenizer(
-                    dataset[i]["text"], return_tensors="pt", max_length=max_seq_len, truncation=True
-                ).input_ids
+                text = dataset[i]["text"]
+                if use_chat_template:
+                    input_ids = encode_chat_sample(text)
+                else:
+                    input_ids = tokenizer(
+                        text, return_tensors="pt", max_length=max_seq_len, truncation=True
+                    ).input_ids
                 samples.append(input_ids)
         else:
             for i in range(n_samples):
-                messages = [
-                    {"role": "system", "content": ""},
-                    {"role": "user", "content": dataset[i]}
-                ]
-                prompt = tokenizer.apply_chat_template(messages)
-                input_ids = tokenizer(
-                    prompt, return_tensors="pt", max_length=max_seq_len, truncation=True
-                ).input_ids
+                input_ids = encode_chat_sample(dataset[i])
                 samples.append(input_ids)
 
         return samples
@@ -188,7 +201,10 @@ class SmoothQuantizer:
             tokenizer=self.tokenizer,
             n_samples=n_samples,
             max_seq_len=max_seq_len,
-            split=self.split
+            split=self.split,
+            use_chat_template=getattr(self.model.args, "calib_use_chat_template", False),
+            calib_system_prompt=getattr(self.model.args, "calib_system_prompt", ""),
+            calib_enable_thinking=getattr(self.model.args, "calib_enable_thinking", None),
         )
         return samples
 
