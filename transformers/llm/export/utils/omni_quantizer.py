@@ -92,7 +92,16 @@ class OmniQuantizer:
         torch.cuda.empty_cache()
 
     @staticmethod
-    def get_calib_dataset(data, tokenizer=None, n_samples=128, max_seq_len=512, split="train"):
+    def get_calib_dataset(
+        data,
+        tokenizer=None,
+        n_samples=128,
+        max_seq_len=512,
+        split="train",
+        use_chat_template=False,
+        calib_system_prompt="",
+        calib_enable_thinking=None,
+    ):
         custom_calib_data = False
         if isinstance(data, str):
             from datasets import load_dataset
@@ -107,6 +116,20 @@ class OmniQuantizer:
         else:
             raise NotImplementedError("Data loading error")
 
+        def encode_sample(text):
+            if use_chat_template:
+                messages = [
+                    {"role": "system", "content": calib_system_prompt},
+                    {"role": "user", "content": text},
+                ]
+                template_kwargs = {}
+                if calib_enable_thinking is not None:
+                    template_kwargs["enable_thinking"] = calib_enable_thinking
+                text = tokenizer.apply_chat_template(messages, **template_kwargs)
+            return tokenizer(
+                text, return_tensors="pt", max_length=max_seq_len, truncation=True
+            ).input_ids
+
         samples = []
         if custom_calib_data == False:
             dataset = dataset.shuffle(seed=42)
@@ -120,9 +143,7 @@ class OmniQuantizer:
                         idx += 1
                         continue
 
-                    input_ids = tokenizer(
-                        text, return_tensors="pt", max_length=max_seq_len, truncation=True
-                    ).input_ids
+                    input_ids = encode_sample(text)
                     # skip empty tokenized inputs
                     if input_ids.numel() > 0:
                         samples.append(input_ids)
@@ -132,11 +153,10 @@ class OmniQuantizer:
                 idx += 1
         else:
             for i in range(min(n_samples, len(dataset))):
-                messages = [{"role": "system", "content": ""}, {"role": "user", "content": dataset[i]}]
-                prompt = tokenizer.apply_chat_template(messages)
-                input_ids = tokenizer(
-                    prompt, return_tensors="pt", max_length=max_seq_len, truncation=True
-                ).input_ids
+                text = dataset[i]
+                if not text.strip():
+                    continue
+                input_ids = encode_sample(text)
 
                 if input_ids.numel() > 0:
                     samples.append(input_ids)
@@ -150,7 +170,10 @@ class OmniQuantizer:
             tokenizer=self.tokenizer,
             n_samples=n_samples,
             max_seq_len=max_seq_len,
-            split=self.split
+            split=self.split,
+            use_chat_template=getattr(self.model.args, "calib_use_chat_template", False),
+            calib_system_prompt=getattr(self.model.args, "calib_system_prompt", ""),
+            calib_enable_thinking=getattr(self.model.args, "calib_enable_thinking", None),
         )
         return samples
 
