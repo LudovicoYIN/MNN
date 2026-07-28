@@ -27,7 +27,7 @@ static MNN::Express::VARP _CrossEntropy(std::vector<MNN::Express::VARP> inputs, 
 
 int main(int argc, const char* argv[]) {
     if (argc < 3) {
-        MNN_PRINT("Usage: ./ppl_eval model/config.json wiki_output max_length\n");
+        MNN_PRINT("Usage: ./ppl_eval model/config.json wiki_output max_length [--llama-stride]\n");
         return 0;
     }
     auto llmPath = argv[1];
@@ -36,6 +36,7 @@ int main(int argc, const char* argv[]) {
     if (argc >= 4) {
         maxLength = std::stoi(argv[3]);
     }
+    const bool llamaStride = argc >= 5 && std::string(argv[4]) == "--llama-stride";
     FUNC_PRINT_ALL(llmPath, s);
     FUNC_PRINT_ALL(textPath, s);
     std::shared_ptr<MNN::Transformer::Llm> llm(MNN::Transformer::Llm::createLLM(llmPath));
@@ -96,6 +97,11 @@ int main(int argc, const char* argv[]) {
     int lossNumber = 0;
     for (size_t begin = 0; begin < seqLen; begin += stride) {
         auto end = std::min(begin + contextLength, seqLen);
+        // Match llama.cpp --ppl-stride: score only the final stride tokens of
+        // complete context windows, so every target has identical context.
+        if (llamaStride && end - begin < contextLength) {
+            break;
+        }
         std::vector<int> chunkIds(end-begin);
         ::memcpy(chunkIds.data(), inputIds.data() + begin, chunkIds.size() * sizeof(int));
         llm->reset();
@@ -105,12 +111,20 @@ int main(int argc, const char* argv[]) {
         if (prevEnd != 0) {
             trgLen += 1;
         }
-        std::vector<int> starts = {(int)(chunkIds.size() - trgLen), 0};
-        std::vector<int> size = {(int)trgLen-1, -1};
+        std::vector<int> starts;
+        std::vector<int> size;
+        if (llamaStride) {
+            starts = {(int)(chunkIds.size() - stride - 1), 0};
+            size = {(int)stride, -1};
+        } else {
+            starts = {(int)(chunkIds.size() - trgLen), 0};
+            size = {(int)trgLen-1, -1};
+        }
         auto startVar = MNN::Express::_Const(starts.data(), {2}, MNN::Express::NCHW, halide_type_of<int>());
         auto sizeVar = MNN::Express::_Const(size.data(), {2}, MNN::Express::NCHW, halide_type_of<int>());
         logits = MNN::Express::_Slice(logits, startVar, sizeVar);
-        auto target = _Const(chunkIds.data() + starts[0] + 1, {(int)trgLen - 1}, NCHW, halide_type_of<int>());
+        const int targetLength = llamaStride ? (int)stride : (int)trgLen - 1;
+        auto target = _Const(chunkIds.data() + starts[0] + 1, {targetLength}, NCHW, halide_type_of<int>());
         auto loss = cross->onForward({logits, target})[0]->readMap<float>()[0];
         lossSum+=loss;
         lossNumber++;

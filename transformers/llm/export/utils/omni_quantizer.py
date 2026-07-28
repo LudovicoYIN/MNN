@@ -18,6 +18,9 @@ class OmniQuantizer:
         max_calib_seq_len=128,
         act_bit=8,
         act_sym=True,
+        weight_bit=4,
+        weight_group_size=0,
+        legacy_fake_quant=False,
         generate_for_npu=False,
         epochs=20,
         lr=5e-3,
@@ -27,6 +30,9 @@ class OmniQuantizer:
         self.tokenizer = model.tokenizer
         self.act_bit = act_bit
         self.act_sym = act_sym
+        self.weight_bit = weight_bit
+        self.weight_group_size = weight_group_size
+        self.legacy_fake_quant = legacy_fake_quant
         self.generate_for_npu = generate_for_npu
 
         self.epochs = epochs
@@ -253,9 +259,22 @@ class OmniQuantizer:
 
         log_scale = torch.nn.Parameter(torch.log(scales_init))
 
+        in_features = weights.shape[1]
+        if self.legacy_fake_quant:
+            block_size, block_num = in_features, 1
+        else:
+            block_size = in_features if self.weight_group_size == 0 else self.weight_group_size
+            while in_features % block_size != 0:
+                block_size //= 2
+            block_num = in_features // block_size
+
         with torch.no_grad():
             w_init_smooth = weights * scales_init.view(1, -1)
-            clip_init = w_init_smooth.abs().max(dim=1, keepdim=True)[0]
+            if self.legacy_fake_quant:
+                clip_init = w_init_smooth.abs().max(dim=1, keepdim=True)[0]
+            else:
+                # Match MNNConverter's symmetric grouped weight quantization.
+                clip_init = w_init_smooth.reshape(-1, block_num, block_size).abs().amax(dim=-1, keepdim=True)
 
         clip_val = torch.nn.Parameter(clip_init)
 
@@ -271,7 +290,7 @@ class OmniQuantizer:
         # Pre-compute constants for quantization
         act_bit = self.act_bit
         act_sym = self.act_sym
-        q_max_w = 2 ** (act_bit - 1) - 1
+        q_max_w = 2 ** ((act_bit if self.legacy_fake_quant else self.weight_bit) - 1) - 1
 
         # Inline quantize functions to reduce function call overhead
         if act_sym:
@@ -346,10 +365,15 @@ class OmniQuantizer:
 
                 # Inline quantize_weight_with_clip
                 clip_v = F.relu(clip_val) + 1e-5
-                w_clamped = torch.clamp(w_sim, -clip_v, clip_v)
+                if self.legacy_fake_quant:
+                    w_clamped = torch.clamp(w_sim, -clip_v, clip_v)
+                else:
+                    w_groups = w_sim.reshape(-1, block_num, block_size)
+                    w_clamped = torch.clamp(w_groups, -clip_v, clip_v)
                 w_scale = clip_v / q_max_w
                 w_q = torch.round(w_clamped / w_scale) * w_scale
                 w_q = (w_q - w_clamped).detach() + w_clamped
+                w_q = w_q.reshape_as(w_sim)
 
                 x_q = x_q.to(dtype=target_dtype)
                 w_q = w_q.to(dtype=target_dtype)
@@ -388,7 +412,11 @@ class OmniQuantizer:
                 layer_clip = final_clip[current_idx : current_idx + num_out]
 
                 fc.weight.mul_(final_scale.view(1, -1))
-                fc.weight.data = torch.clamp(fc.weight.data, -layer_clip, layer_clip)
+                if self.legacy_fake_quant:
+                    fc.weight.data = torch.clamp(fc.weight.data, -layer_clip, layer_clip)
+                else:
+                    weight_groups = fc.weight.data.reshape(num_out, block_num, block_size)
+                    fc.weight.data = torch.clamp(weight_groups, -layer_clip, layer_clip).reshape_as(fc.weight.data)
 
                 current_idx += num_out
 

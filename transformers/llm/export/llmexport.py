@@ -20,6 +20,7 @@ from utils.mnn_converter import MNNConverter
 from utils.awq_quantizer import AwqQuantizer
 from utils.smooth_quantizer import SmoothQuantizer
 from utils.omni_quantizer import OmniQuantizer
+from utils.sinq_quantizer import SinqQuantizer
 from utils.torch_utils import onnx_export
 
 class LlmExporter(torch.nn.Module):
@@ -560,6 +561,9 @@ class LlmExporter(torch.nn.Module):
             max_calib_samples=calib_samples,
             act_bit=self.args.act_bit,
             act_sym=self.args.act_sym,
+            weight_bit=self.args.quant_bit,
+            weight_group_size=self.args.quant_block,
+            legacy_fake_quant=self.args.omni_legacy_fake_quant,
             generate_for_npu=self.args.generate_for_npu,
 
             epochs=getattr(self.args, 'omni_epochs', 20),
@@ -567,6 +571,15 @@ class LlmExporter(torch.nn.Module):
             wd=getattr(self.args, 'omni_wd', 1e-4)
         )
         self.omni_quantizer.quantize(self.args.generate_for_npu)
+
+    def sinq_quant(self):
+        self.sinq_quantizer = SinqQuantizer(
+            self.model,
+            group_size=self.args.sinq_group_size or self.args.quant_block,
+            iterations=self.args.sinq_iterations,
+            repeats=self.args.sinq_repeats,
+        )
+        self.sinq_quantizer.quantize()
 
     def smooth_quant(self):
         total_lines = 128
@@ -680,6 +693,8 @@ class LlmExporter(torch.nn.Module):
 
     def export(self, export_type):
         if not self.args.skip_weight:
+            if self.args.sinq:
+                self.sinq_quant()
             if self.args.omni:
                 self.omni_quant()
             if self.args.awq:
@@ -883,6 +898,11 @@ def build_args(parser):
     parser.add_argument('--omni_epochs', type=int, default=20, help='OmniQuant 优化的轮数')
     parser.add_argument('--omni_lr', type=float, default=5e-3, help='OmniQuant 的学习率')
     parser.add_argument('--omni_wd', type=float, default=1e-4, help='OmniQuant 的权重衰减')
+    parser.add_argument('--omni_legacy_fake_quant', action='store_true', help="Use OmniQuant's pre-grouped W16 fake-quant path for A/B comparison.")
+    parser.add_argument('--sinq', action='store_true', help='Apply deployable Pre-SINQ weight reparameterization before export.')
+    parser.add_argument('--sinq_group_size', type=int, default=None, help='Pre-SINQ Sinkhorn group size; defaults to quant_block.')
+    parser.add_argument('--sinq_iterations', type=int, default=4, help='Sinkhorn iterations per Pre-SINQ pass.')
+    parser.add_argument('--sinq_repeats', type=int, default=1, help='Number of Pre-SINQ passes.')
 
 def export(path, **kwargs):
     parser = argparse.ArgumentParser()
