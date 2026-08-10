@@ -501,11 +501,23 @@ static NetT* _replaceConstOp(const void* buffer, size_t bufferSize,
     auto net = flatbuffers::GetRoot<Net>(buffer)->UnPack();
     for (int i = 0; i < constOpId.size(); ++i) {
         auto op = net->oplists[constOpId[i]].get();
-        auto index = op->outputIndexes[0];
-        auto iter = constTensorData.find(index);
-        if (iter == constTensorData.end()) {
+        bool hasCompleteData = op != nullptr && !op->outputIndexes.empty();
+        if (hasCompleteData) {
+            for (auto outputIndex : op->outputIndexes) {
+                auto outputIter = constTensorData.find(outputIndex);
+                if (outputIter == constTensorData.end() || std::get<3>(outputIter->second).empty()) {
+                    hasCompleteData = false;
+                    break;
+                }
+            }
+        }
+        if (!hasCompleteData) {
+            MNN_ERROR("Skip replacing op %s with Const because its output data was not materialized.\n",
+                      op != nullptr ? op->name.c_str() : "<null>");
             continue;
         }
+        auto index = op->outputIndexes[0];
+        auto iter = constTensorData.find(index);
         auto name = op->name;
         std::unique_ptr<MNN::OpT> newOp(new OpT);
         newOp->type = OpType_Const;
