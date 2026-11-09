@@ -1,0 +1,1 @@
+{"model":"Qwen3.5-4B-MNN-Q4","modelSize":2.204026723280549,"backend":"CUDA","threads":8,"useMmap":false,"precision":2,"memory":2,"power":0,"quantKv":0,"flashAttention":1,"results":[{"type":"prefill_and_decode","prompt_len":4096,"generate_len":128,"prefill_tps":1908.2748867579199,"prefill_std":1.0450813691080115,"decode_tps":17.683027396008265,"decode_std":0.016884389992747614}]}

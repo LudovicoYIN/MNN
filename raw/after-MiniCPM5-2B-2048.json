@@ -1,0 +1,1 @@
+{"model":"MiniCPM5-2B-MNN-Q4","modelSize":1.179586736485362,"backend":"CUDA","threads":8,"useMmap":false,"precision":2,"memory":2,"power":0,"quantKv":0,"flashAttention":1,"results":[{"type":"prefill_and_decode","prompt_len":2048,"generate_len":128,"prefill_tps":2275.276984595314,"prefill_std":4.327206783348795,"decode_tps":11.406150057575612,"decode_std":0.003537203431803547}]}

@@ -1,0 +1,266 @@
+[
+  {
+    "model": "Qwen3.5-4B",
+    "context": 512,
+    "before": {
+      "type": "prefill_and_decode",
+      "prompt_len": 512,
+      "generate_len": 128,
+      "prefill_tps": 2774.53728391346,
+      "prefill_std": 22.65467975940182,
+      "decode_tps": 74.55701930036965,
+      "decode_std": 0.17510520651247188,
+      "sampled_gpu_memory_max_mib": 6198.0,
+      "temperature_range_c": [
+        40.0,
+        57.0
+      ],
+      "sm_clock_range_mhz": [
+        210.0,
+        1980.0
+      ],
+      "rope_fallback_count": 8
+    },
+    "after": {
+      "type": "prefill_and_decode",
+      "prompt_len": 512,
+      "generate_len": 128,
+      "prefill_tps": 3688.3482411998652,
+      "prefill_std": 7.628415221075925,
+      "decode_tps": 75.84476236273747,
+      "decode_std": 0.016402651652326964,
+      "sampled_gpu_memory_max_mib": 6190.0,
+      "temperature_range_c": [
+        53.0,
+        64.0
+      ],
+      "sm_clock_range_mhz": [
+        210.0,
+        1980.0
+      ],
+      "rope_fallback_count": 0
+    },
+    "prefill_tps_change_percent": 32.93561642096525,
+    "decode_tps_change_percent": 1.7271922542663187
+  },
+  {
+    "model": "Qwen3.5-4B",
+    "context": 2048,
+    "before": {
+      "type": "prefill_and_decode",
+      "prompt_len": 2048,
+      "generate_len": 128,
+      "prefill_tps": 2171.597188897472,
+      "prefill_std": 4.830327023287762,
+      "decode_tps": 31.26630817898822,
+      "decode_std": 0.059945964875838045,
+      "sampled_gpu_memory_max_mib": 7530.0,
+      "temperature_range_c": [
+        52.0,
+        61.0
+      ],
+      "sm_clock_range_mhz": [
+        1905.0,
+        1965.0
+      ],
+      "rope_fallback_count": 8
+    },
+    "after": {
+      "type": "prefill_and_decode",
+      "prompt_len": 2048,
+      "generate_len": 128,
+      "prefill_tps": 2841.0919509923624,
+      "prefill_std": 8.188084487505485,
+      "decode_tps": 31.51925122828849,
+      "decode_std": 0.002669336237285309,
+      "sampled_gpu_memory_max_mib": 7498.0,
+      "temperature_range_c": [
+        60.0,
+        68.0
+      ],
+      "sm_clock_range_mhz": [
+        1860.0,
+        1950.0
+      ],
+      "rope_fallback_count": 0
+    },
+    "prefill_tps_change_percent": 30.82960161846571,
+    "decode_tps_change_percent": 0.8089955739330135
+  },
+  {
+    "model": "Qwen3.5-4B",
+    "context": 4096,
+    "before": {
+      "type": "prefill_and_decode",
+      "prompt_len": 4096,
+      "generate_len": 128,
+      "prefill_tps": 1583.4316671635727,
+      "prefill_std": 1.589787980176861,
+      "decode_tps": 17.597022429817454,
+      "decode_std": 0.012023602551322121,
+      "sampled_gpu_memory_max_mib": 9014.0,
+      "temperature_range_c": [
+        57.0,
+        68.0
+      ],
+      "sm_clock_range_mhz": [
+        1635.0,
+        1950.0
+      ],
+      "rope_fallback_count": 8
+    },
+    "after": {
+      "type": "prefill_and_decode",
+      "prompt_len": 4096,
+      "generate_len": 128,
+      "prefill_tps": 1908.2748867579198,
+      "prefill_std": 1.0450813691080114,
+      "decode_tps": 17.683027396008264,
+      "decode_std": 0.016884389992747613,
+      "sampled_gpu_memory_max_mib": 8998.0,
+      "temperature_range_c": [
+        62.0,
+        71.0
+      ],
+      "sm_clock_range_mhz": [
+        1740.0,
+        1950.0
+      ],
+      "rope_fallback_count": 0
+    },
+    "prefill_tps_change_percent": 20.51513976452448,
+    "decode_tps_change_percent": 0.488747266952827
+  },
+  {
+    "model": "MiniCPM5-2B",
+    "context": 512,
+    "before": {
+      "type": "prefill_and_decode",
+      "prompt_len": 512,
+      "generate_len": 128,
+      "prefill_tps": 2727.6133749697615,
+      "prefill_std": 31.51986345040714,
+      "decode_tps": 35.750398990623275,
+      "decode_std": 0.01606952322298408,
+      "sampled_gpu_memory_max_mib": 3286.0,
+      "temperature_range_c": [
+        55.0,
+        62.0
+      ],
+      "sm_clock_range_mhz": [
+        210.0,
+        1965.0
+      ],
+      "rope_fallback_count": 42
+    },
+    "after": {
+      "type": "prefill_and_decode",
+      "prompt_len": 512,
+      "generate_len": 128,
+      "prefill_tps": 5255.0075672566245,
+      "prefill_std": 10.685906178921284,
+      "decode_tps": 37.10606569505963,
+      "decode_std": 0.0436632013874594,
+      "sampled_gpu_memory_max_mib": 3304.0,
+      "temperature_range_c": [
+        60.0,
+        65.0
+      ],
+      "sm_clock_range_mhz": [
+        390.0,
+        1935.0
+      ],
+      "rope_fallback_count": 0
+    },
+    "prefill_tps_change_percent": 92.65954682139956,
+    "decode_tps_change_percent": 3.7920323764552233
+  },
+  {
+    "model": "MiniCPM5-2B",
+    "context": 2048,
+    "before": {
+      "type": "prefill_and_decode",
+      "prompt_len": 2048,
+      "generate_len": 128,
+      "prefill_tps": 1543.889505290996,
+      "prefill_std": 3.1427708956699414,
+      "decode_tps": 11.255675190949036,
+      "decode_std": 0.00405081407741106,
+      "sampled_gpu_memory_max_mib": 8570.0,
+      "temperature_range_c": [
+        59.0,
+        66.0
+      ],
+      "sm_clock_range_mhz": [
+        1890.0,
+        1950.0
+      ],
+      "rope_fallback_count": 42
+    },
+    "after": {
+      "type": "prefill_and_decode",
+      "prompt_len": 2048,
+      "generate_len": 128,
+      "prefill_tps": 2275.276984595314,
+      "prefill_std": 4.327206783348795,
+      "decode_tps": 11.406150057575612,
+      "decode_std": 0.003537203431803547,
+      "sampled_gpu_memory_max_mib": 8576.0,
+      "temperature_range_c": [
+        61.0,
+        69.0
+      ],
+      "sm_clock_range_mhz": [
+        1845.0,
+        1950.0
+      ],
+      "rope_fallback_count": 0
+    },
+    "prefill_tps_change_percent": 47.37304559670961,
+    "decode_tps_change_percent": 1.3368799656512609
+  },
+  {
+    "model": "MiniCPM5-2B",
+    "context": 4096,
+    "before": {
+      "type": "prefill_and_decode",
+      "prompt_len": 4096,
+      "generate_len": 128,
+      "prefill_tps": 972.9327668138664,
+      "prefill_std": 1.4857602840631103,
+      "decode_tps": 5.882175001252866,
+      "decode_std": 0.0005363276260919054,
+      "sampled_gpu_memory_max_mib": 14338.0,
+      "temperature_range_c": [
+        60.0,
+        69.0
+      ],
+      "sm_clock_range_mhz": [
+        1770.0,
+        1950.0
+      ],
+      "rope_fallback_count": 42
+    },
+    "after": {
+      "type": "prefill_and_decode",
+      "prompt_len": 4096,
+      "generate_len": 128,
+      "prefill_tps": 1219.7422846925372,
+      "prefill_std": 1.0994350270836624,
+      "decode_tps": 5.926237930274026,
+      "decode_std": 0.000631099320446607,
+      "sampled_gpu_memory_max_mib": 14350.0,
+      "temperature_range_c": [
+        60.0,
+        70.0
+      ],
+      "sm_clock_range_mhz": [
+        1770.0,
+        1950.0
+      ],
+      "rope_fallback_count": 0
+    },
+    "prefill_tps_change_percent": 25.367582046487748,
+    "decode_tps_change_percent": 0.7490924532468801
+  }
+]

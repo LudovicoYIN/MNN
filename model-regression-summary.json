@@ -1,0 +1,30 @@
+[
+  {
+    "model": "Qwen3.5-4B",
+    "prompt": "short",
+    "cuda_before_after_text_exact": true,
+    "cpu_final_expected_answer_pass": true,
+    "cuda_final_expected_answer_pass": true
+  },
+  {
+    "model": "Qwen3.5-4B",
+    "prompt": "long",
+    "cuda_before_after_text_exact": true,
+    "cpu_final_expected_answer_pass": true,
+    "cuda_final_expected_answer_pass": true
+  },
+  {
+    "model": "MiniCPM5-2B",
+    "prompt": "short",
+    "cuda_before_after_text_exact": true,
+    "cpu_final_expected_answer_pass": true,
+    "cuda_final_expected_answer_pass": true
+  },
+  {
+    "model": "MiniCPM5-2B",
+    "prompt": "long",
+    "cuda_before_after_text_exact": true,
+    "cpu_final_expected_answer_pass": true,
+    "cuda_final_expected_answer_pass": true
+  }
+]
