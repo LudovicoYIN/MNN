@@ -1,0 +1,164 @@
+[
+  {
+    "model": "Qwen3.5-4B",
+    "lengths": [
+      512
+    ],
+    "baseline_wall_s": 4.143672015983611,
+    "attention_only_wall_s": 3.6321250691544265,
+    "wall_reduction_percent": 12.34525669155201
+  },
+  {
+    "model": "Qwen3.5-4B",
+    "lengths": [
+      2048
+    ],
+    "baseline_wall_s": 9.83733473578468,
+    "attention_only_wall_s": 6.721871322020888,
+    "wall_reduction_percent": 31.669791640116273
+  },
+  {
+    "model": "Qwen3.5-4B",
+    "lengths": [
+      4096
+    ],
+    "baseline_wall_s": 19.14143103384413,
+    "attention_only_wall_s": 13.461034585023299,
+    "wall_reduction_percent": 29.67592359618919
+  },
+  {
+    "model": "Qwen3.5-4B",
+    "lengths": [
+      512,
+      512
+    ],
+    "baseline_wall_s": 7.270626949844882,
+    "attention_only_wall_s": 6.227522244909778,
+    "wall_reduction_percent": 14.34683297782674
+  },
+  {
+    "model": "Qwen3.5-4B",
+    "lengths": [
+      2048,
+      2048
+    ],
+    "baseline_wall_s": 17.626570562133566,
+    "attention_only_wall_s": 11.926404533907771,
+    "wall_reduction_percent": 32.338485856524045
+  },
+  {
+    "model": "Qwen3.5-4B",
+    "lengths": [
+      128,
+      4096
+    ],
+    "baseline_wall_s": 21.749201664002612,
+    "attention_only_wall_s": 15.034717675996944,
+    "wall_reduction_percent": 30.872323921290857
+  },
+  {
+    "model": "Qwen3.5-4B",
+    "lengths": [
+      512,
+      512,
+      512,
+      512
+    ],
+    "baseline_wall_s": 14.041040531126782,
+    "attention_only_wall_s": 10.930770286126062,
+    "wall_reduction_percent": 22.151280299389065
+  },
+  {
+    "model": "Qwen3.5-4B",
+    "lengths": [
+      128,
+      512,
+      1024,
+      2048
+    ],
+    "baseline_wall_s": 19.226070863893256,
+    "attention_only_wall_s": 13.518852851819247,
+    "wall_reduction_percent": 29.684786103603823
+  },
+  {
+    "model": "MiniCPM5-2B",
+    "lengths": [
+      512
+    ],
+    "baseline_wall_s": 5.173598964000121,
+    "attention_only_wall_s": 2.5956908860243857,
+    "wall_reduction_percent": 49.828138901252395
+  },
+  {
+    "model": "MiniCPM5-2B",
+    "lengths": [
+      2048
+    ],
+    "baseline_wall_s": 18.083270329982042,
+    "attention_only_wall_s": 7.773576873121783,
+    "wall_reduction_percent": 57.01232834951762
+  },
+  {
+    "model": "MiniCPM5-2B",
+    "lengths": [
+      4096
+    ],
+    "baseline_wall_s": 40.35573456692509,
+    "attention_only_wall_s": 20.176845327951014,
+    "wall_reduction_percent": 50.00253236751233
+  },
+  {
+    "model": "MiniCPM5-2B",
+    "lengths": [
+      512,
+      512
+    ],
+    "baseline_wall_s": 11.923073328100145,
+    "attention_only_wall_s": 7.270010494161397,
+    "wall_reduction_percent": 39.02570005144956
+  },
+  {
+    "model": "MiniCPM5-2B",
+    "lengths": [
+      2048,
+      2048
+    ],
+    "baseline_wall_s": 34.7043204610236,
+    "attention_only_wall_s": 14.522441880078986,
+    "wall_reduction_percent": 58.15379270604324
+  },
+  {
+    "model": "MiniCPM5-2B",
+    "lengths": [
+      128,
+      4096
+    ],
+    "baseline_wall_s": 42.97130146296695,
+    "attention_only_wall_s": 21.7664553609211,
+    "wall_reduction_percent": 49.346529846950006
+  },
+  {
+    "model": "MiniCPM5-2B",
+    "lengths": [
+      512,
+      512,
+      512,
+      512
+    ],
+    "baseline_wall_s": 22.808072129031643,
+    "attention_only_wall_s": 12.991917746840045,
+    "wall_reduction_percent": 43.03807146285257
+  },
+  {
+    "model": "MiniCPM5-2B",
+    "lengths": [
+      128,
+      512,
+      1024,
+      2048
+    ],
+    "baseline_wall_s": 35.2405392951332,
+    "attention_only_wall_s": 17.158359710127115,
+    "wall_reduction_percent": 51.31073458771749
+  }
+]

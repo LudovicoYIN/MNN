@@ -1,0 +1,66 @@
+{
+  "attention-upstream-concurrency.svg": {
+    "bytes": 93431,
+    "sha256": "7ac3a6c10ae452bded2c9a51391118c183e06217a2e2e7772f3943bcf8bf0241"
+  },
+  "attention-publish-precommit.log": {
+    "bytes": 160,
+    "sha256": "2f5d1b120323b658f6ec6bc3e79276764d7b24ef22f62a691f12f333b2f36139"
+  },
+  "upstream_concurrent_decode_ab.py": {
+    "bytes": 3051,
+    "sha256": "93564c397b07d005dfb9558cd1ccc28c1963a7b8e9a098a327165ca960baf193"
+  },
+  "attention-only-current.patch": {
+    "bytes": 11040,
+    "sha256": "41338c785c72576f56e40e6ba333ad972d36372a1ad6cd0dde479091a541736c"
+  },
+  "run_review_attention_backend.py": {
+    "bytes": 1013,
+    "sha256": "632f332dc37f7b6ec804afa5dd96765889513f297a058b8ba5b4850d05548899"
+  },
+  "attention-publish-cuda-format.log": {
+    "bytes": 38,
+    "sha256": "abc07078597158b78506ec468bafc9ea7fe7ec1c82e2559e5766f823634bf85e"
+  },
+  "README.md": {
+    "bytes": 3265,
+    "sha256": "dc29ae18be7bce0042e3b7d8fd8e5d054ee1b8c8bf12b1cf5a16cece6e48caef"
+  },
+  "attention-publish-commit-message.log": {
+    "bytes": 240,
+    "sha256": "f60bbcc808ac5858755fd75773df9c3c71322370456a1a8572cfdd00bd0fa3a1"
+  },
+  "upstream-concurrency-summary.json": {
+    "bytes": 3571,
+    "sha256": "768eec5d9d39073db307f008087affc9818bd805d08404a890097936c1219428"
+  },
+  "attention-upstream-concurrency.png": {
+    "bytes": 189189,
+    "sha256": "ea7119362f1d3268aae1c9db0e1ba44584b690559f5139321d70ce2ca7c7b0a9"
+  },
+  "upstream_attention_ab.py": {
+    "bytes": 2252,
+    "sha256": "1a797041744bc718b4dff2f876883fbd881b53ef73df3d395f976483967750c8"
+  },
+  "raw-results.zip": {
+    "bytes": 114197,
+    "sha256": "6387850d38aba94eca1aa7f14b1bb6aedda88fd8b3d5a9c9ff73911e4bad45c4"
+  },
+  "attention-upstream-lengths.png": {
+    "bytes": 124776,
+    "sha256": "6d5effabf7a99e35a21d7df51e3c303283ef10e2c81a4ef703b72b75acf6fe40"
+  },
+  "review_attention_backend.cpp": {
+    "bytes": 4360,
+    "sha256": "cd371c5734f96bd7be522ffbceea6842924ae09516c3443e4c7cf9c97ef9379d"
+  },
+  "attention-upstream-lengths.svg": {
+    "bytes": 76749,
+    "sha256": "3a8c8300c9d66f9b908fb6e3b101b70480a04ade2ef620a8e581236efec03685"
+  },
+  "plot_upstream_attention.py": {
+    "bytes": 3593,
+    "sha256": "55d5290b680c377ebbafc295191e7f044c95e7b81c03697b7dd6a00958aa3279"
+  }
+}
